@@ -35,6 +35,35 @@ the product changes this file first. The coordinator keeps it.
     accent and sorts them first under "most decisions waiting on you")
 12. "maybe let these agents work together?" (read as: the agents behind a group of related questions confer and bring
    him one combined question, or settle it without him)
+15. THE PURPOSE, 15 Sep 2026, verbatim: "what im hoping for is a less disconnected network of work done by the team
+    (me, you and the other agents) and a more "neural" network so to speak. If the EQ agent finds some crazy technique
+    for plugin development, then it needs to 1 know that is a crazy development 2 know to alert the others 3 present
+    the others with helpful information 4 the others should give it an honest go and try to use that information....
+    This app is trying to encourage all of that. Right now the plugin development happening in paralell across all my
+    agents feels disconnected... certain ideas are not getting carried over. I'd like to nip that in the butt now.
+    This agent console (new name) is like a twitter/slack for my agents. Maybe i should just get slack and fill it
+    with agents for now? idk im open to ideas here"
+    (so: the app is renamed THE AGENT CONSOLE; its first job is carrying ideas between agents, in his four steps;
+    every feature is judged by whether it helps a finding travel from one lane into another lane's work. Whether to
+    use Slack instead, for now, is his open question and is not decided.)
+    Same day: "id rather the agents drafting this document right now hear my words then make sure they are written in
+    stone somewhere" (this entry is that stone; a change to the product changes this file first).
+16. ONE ANSWER, EVERY ASKER, 15 Sep 2026, verbatim: "i want to be knocking two birds out with one stone systematically
+    with this app. Tasks waiting for my word across agents should be grouped together by similarity... If i have 3
+    agents asking the same question, then i should just have to give one answer one time... understand? if a 4th
+    agent stragler comes asking the same question 20 minutes later, maybe he can get the memo when hes ready too.
+    you know?"
+    (so: asks from different agents that are the same question become ONE item; his one answer goes to every agent
+    that asked; his answers are kept, and an agent that asks the same question later is handed the existing answer
+    when it asks, instead of the question reaching him again. Grouping by similarity is a requirement, not a
+    candidate for removal; how to make it reliable is open.)
+17. HIS RULINGS ON THE REDESIGN, 15 Sep 2026, verbatim: "1. yes 2. ok 3. ok 4. ok 5. no they are going to the workflow
+    agent (you). you are still the coordinator of all the agents 6. hell no they cant leave 7. yes all at once"
+    (so: Phase 0 starts now; grouping is lanes marking related asks with the AI pass as backup, proven by a test of
+    three askers plus a late asker; Slack is checked before the screen redesign; "Time spent" and "Tasks run" give way
+    to "last real change" and "waiting since"; his replies go to the COORDINATOR, never to per-agent reply files, and
+    the coordinator routes them; the hover panel, the eight sort orders and the Headline/Summary menu are KEPT;
+    a reply goes out at once and the already-resolved check becomes a hint.)
 
 ## 1. The table (top)
 Columns, exactly: Conversation | Description | Time spent | Running now | Tasks run.

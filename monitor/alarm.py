@@ -20,8 +20,10 @@ work, a mistake that may have spread. It is NOT for questions for Mason (those g
   python3 alarm.py --selftest      planted controls
 
 The ledger is append-only: nothing is ever edited or deleted; an alarm's state is the last event about it.
+Every write holds an exclusive flock on the ledger file itself (15 Sep): it is only ever appended to, never
+replaced, so it is its own lock file, and two agents raising at once cannot interleave or reuse an id.
 """
-import argparse, glob, hashlib, json, os, sys, tempfile, time
+import argparse, contextlib, fcntl, glob, hashlib, json, os, sys, tempfile, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LAB = os.path.dirname(HERE)
@@ -60,9 +62,26 @@ def read(ledger=None):
     return out
 
 
+@contextlib.contextmanager
+def _locked(ledger=None):
+    """The ledger opened for appending under an exclusive flock, released after the write is flushed.
+    Until 15 Sep writers took no lock (Grok, Composer, Gemini, GPT-5.6 Sol reviews)."""
+    with open(ledger or LEDGER, "a", encoding="utf-8") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield fh
+        finally:
+            fh.flush()
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _write(fh, rec):
+    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
 def append(rec, ledger=None):
-    with open(ledger or LEDGER, "a") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    with _locked(ledger) as fh:
+        _write(fh, rec)
 
 
 def state(events):
@@ -111,8 +130,22 @@ def live_sessions():
     return sorted(set(names), key=str.lower)
 
 
-def new_id(frm, why):
-    return "A" + time.strftime("%m%d-%H%M%S") + "-" + hashlib.sha1((frm + why).encode()).hexdigest()[:4]
+def _id_stamp():
+    return time.strftime("%m%d-%H%M%S")
+
+
+def new_id(frm, why, taken=()):
+    """"A<month><day>-<hour><minute><second>-<4 hex of sender and reason>", and when that id is already in
+    taken, the same with -2, -3 and so on. Until 15 Sep two identical alarms from one sender in the same
+    second got the same id, and state() keeps only the last "raised" event per id, so the first alarm
+    disappeared from an append-only ledger (GPT-5.6 Sol review)."""
+    base = "A" + _id_stamp() + "-" + hashlib.sha1((frm + why).encode()).hexdigest()[:4]
+    if base not in taken:
+        return base
+    n = 2
+    while f"{base}-{n}" in taken:
+        n += 1
+    return f"{base}-{n}"
 
 
 def cmd_raise(frm, why, ledger=None, sessions=None):
@@ -120,8 +153,9 @@ def cmd_raise(frm, why, ledger=None, sessions=None):
     if len(why) < MIN_WHY:
         raise SystemExit(f"REFUSED: say what is wrong and what help you need, in at least {MIN_WHY} characters. "
                          f"The other agents will stop their work to read it.")
-    i = new_id(frm, why)
-    append({"id": i, "event": "raised", "t": now_local(), "from": frm, "why": why}, ledger)
+    with _locked(ledger) as fh:                       # the ids are read and the new one written under one lock
+        i = new_id(frm, why, {e.get("id") for e in read(ledger)})
+        _write(fh, {"id": i, "event": "raised", "t": now_local(), "from": frm, "why": why})
     others = [s for s in (sessions if sessions is not None else live_sessions()) if s.lower() != frm.lower()]
     msg = (f"ALARM {i} from {frm}: {why} "
            f"If you can help, reply to {frm} and run: python3 \"{os.path.join(HERE, 'alarm.py')}\" ack {i} --from \"<your name>\" --note \"<what you are doing>\". "
@@ -205,6 +239,36 @@ def selftest():
     with open(led, "a") as f: f.write("{not json\n")
     j, _, _ = cmd_raise("Storage", "Free disk will reach the floor within the hour and two long runs are registered.", led, [])
     res.append(("a corrupt ledger line does not hide a real alarm", [x["id"] for x in open_alarms(led)] == [j]))
+    # 5. (15 Sep) two identical alarms from one sender in the same second: different ids, both open
+    saved_stamp = globals()["_id_stamp"]
+    globals()["_id_stamp"] = lambda: "0915-120000"      # both raises land in one second, always
+    try:
+        led5 = os.path.join(d, "same-second.jsonl")
+        why5 = "The shared build tree is corrupt and every lane that builds tonight will ship a stale binary."
+        a5, _, _ = cmd_raise("Dreiling_Clip", why5, led5, [])
+        b5, _, _ = cmd_raise("Dreiling_Clip", why5, led5, [])
+        open5 = sorted(x["id"] for x in open_alarms(led5))
+    finally:
+        globals()["_id_stamp"] = saved_stamp
+    res.append((f"two identical alarms from one sender in the same second get different ids and both stay open "
+                f"({a5}, {b5}; open: {len(open5)})", a5 != b5 and open5 == sorted([a5, b5])))
+    # 6. (15 Sep) a write waits while another process holds the ledger's lock, then lands
+    led6 = os.path.join(d, "locked.jsonl")
+    open(led6, "a").close()
+    holder = open(led6, "a")
+    fcntl.flock(holder, fcntl.LOCK_EX)                   # as another agent part way through its write
+    probe = {"id": "A0915-120000-lock", "event": "raised", "t": now_local(), "from": "selftest",
+             "why": "a lock probe written while another writer holds the ledger"}
+    t6 = threading.Thread(target=append, args=(probe, led6), daemon=True)
+    t6.start()
+    time.sleep(0.4)
+    during6 = "A0915-120000-lock" in open(led6).read()
+    fcntl.flock(holder, fcntl.LOCK_UN)
+    holder.close()
+    t6.join(5)
+    after6 = "A0915-120000-lock" in open(led6).read()
+    res.append((f"a write waits while another writer holds the ledger lock, then lands (written while held: {during6}, "
+                f"after release: {after6})", not during6 and after6))
     print("PLANTED CONTROLS")
     for n, ok in res: print(f"  [{'PASS' if ok else 'FAIL'}] {n}")
     bad = [n for n, ok in res if not ok]

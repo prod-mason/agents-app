@@ -44,6 +44,10 @@ WHAT IS ON SCREEN, TOP TO BOTTOM
                   conversation's transcript is mid-turn (row "ticking", monitor_data.live_seconds),
                   frozen otherwise, so a shown second is never taken back.
                   Running now, Tasks run: "?" when unknown, never 0. Total wait ticks too.
+                  Waiting on you: counted from the waiting list's own items for that row's lane (or, with
+                  no lane, its session), never a number a lane typed (count_rows); "?" when it cannot
+                  be known; the number in the red accent when the engine flags that lane's count as not
+                  matching the list. The "most decisions" sort and Total wait read the same count.
   Storage strip   monitor_data.storage()["text"], coloured normal, orange (30 to 40 GiB) or red (under
                   the 30 GiB floor), with the trend when there is one. Hover shows each running run and the
                   Time Machine state.
@@ -107,6 +111,7 @@ import importlib.util
 import json
 import math
 import os
+import queue as queue_mod
 import re
 import subprocess
 import sys
@@ -644,6 +649,214 @@ def sort_arrow(key, reverse):
 
 def time_cell_text(row, now):
     return ENGINE.clock_text(live_seconds(row, now)) if time_known(row) else "?"
+
+
+# ---------------------------------------------------------------------------------------------
+# REDESIGN-PLAN.md Phase 0 (SPEC section 0 item 17): true counts, his words kept, checks capped
+# ---------------------------------------------------------------------------------------------
+
+CHECK_AT_ONCE = 2        # already-resolved checks at one time when he answers several items (each may start Claude)
+# The engine's flag that a lane's own count does not match the waiting list (monitor_data, Phase 0 item 1),
+# read under any of these names, on a row or on the waiting() result, so the window works before and after
+# the engine carries it.
+MISMATCH_ROW_KEYS = ("waiting_mismatch", "count_mismatch", "counts_mismatch", "mismatch")
+# "mismatch_lanes" is the key the engine publishes (a list of lane names; the reasons sit in w["lanes"]); the
+# others are the names the first pass guessed before the engine carried it (second pass, 15 Sep).
+MISMATCH_LIST_KEYS = ("mismatch_lanes", "waiting_mismatches", "count_mismatches", "counts_mismatches", "mismatches",
+                      "lane_mismatches")
+NOTE_FACTS = ("not been read", "no live owner")   # what the app's own two row notes state; the engine's may say it first
+
+
+def _flag_reason(v):
+    """(flagged, reason) for one flag value: True, a reason string, a nonzero number, or a dict (its
+    reason, note or why; "mismatch": False or "ok": True in it means not flagged)."""
+    if isinstance(v, dict):
+        if v.get("mismatch") is False or v.get("ok") is True:
+            return False, ""
+        return bool(v), one_line(clean(v.get("reason") or v.get("note") or v.get("why") or ""))
+    if isinstance(v, str):
+        return bool(v.strip()), one_line(clean(v))
+    if isinstance(v, bool):
+        return v, ""
+    return (isinstance(v, (int, float)) and v != 0), ""
+
+
+def _lane_reason(w, lane):
+    """The engine's own explanation for a lane it flags (monitor_data.lane_report, w["lanes"][lane]): the
+    count from the list beside each number the lane typed, e.g. "0 on the list, but status headline says 2"."""
+    lanes = w.get("lanes") if isinstance(w, dict) else None
+    v = lanes.get(lane) if isinstance(lanes, dict) else None
+    if not isinstance(v, dict):
+        return ""
+    n = _num(v.get("items"))
+    typed = [t for t in (v.get("typed") or []) if isinstance(t, dict) and _num(t.get("said")) is not None]
+    if n is None or not typed:
+        return one_line(v.get("note") or v.get("reason") or "")
+    parts = [f'{one_line(t.get("where") or "its words")} says {t["said"]}' for t in typed if t["said"] != n]
+    return f"{n} on the list, but " + ", ".join(parts) if parts else ""
+
+
+def list_mismatches(w):
+    """{("lane", name casefolded) or ("session", id): reason} from a mismatch report on a waiting() result:
+    the engine's mismatch_lanes (a list of lane names, each reason read from w["lanes"]), or a dict
+    lane -> flag, or a list of dicts with "lane" and/or "session_id"."""
+    out = {}
+    if not isinstance(w, dict):
+        return out
+    for key in MISMATCH_LIST_KEYS:
+        v = w.get(key)
+        if isinstance(v, dict):
+            for name, val in v.items():
+                ok, why = _flag_reason(val)
+                if ok and str(name or "").strip():
+                    out[("lane", str(name).strip().casefold())] = why or _lane_reason(w, str(name).strip())
+        elif isinstance(v, (list, tuple)):
+            for e in v:
+                if isinstance(e, str) and e.strip():
+                    out[("lane", e.strip().casefold())] = _lane_reason(w, e.strip())
+                elif isinstance(e, dict):
+                    ok, why = _flag_reason(e)
+                    if not ok:
+                        continue
+                    if str(e.get("lane") or "").strip():
+                        out[("lane", str(e["lane"]).strip().casefold())] = why or _lane_reason(w, str(e["lane"]).strip())
+                    if e.get("session_id"):
+                        out[("session", str(e["session_id"]))] = why
+    return out
+
+
+def note_adds(engine_note, app_note):
+    """Whether the app's row note says anything the engine's does not. The app's two notes each state one
+    of NOTE_FACTS; when the engine's note already states that fact, the app's adds nothing."""
+    e, a = one_line(engine_note).casefold(), one_line(app_note).casefold()
+    facts = [f for f in NOTE_FACTS if f in a]
+    return any(f not in e for f in facts) if facts else bool(a) and a not in e
+
+
+def count_rows(rows, items, list_read, mismatches=None, as_of=None):
+    """Copies of the rows whose "Waiting on you" number is counted from the waiting list's own items, never a
+    number a lane typed (Phase 0 item 1), so the cell, the "most decisions" sort and Total wait all read the
+    count the list shows:
+      the row's lane is known: the items whose owner lane is that lane;
+      no lane: the items whose owner session is the row's session; when none is, and some item has no live
+        owner (it could be this conversation's), the number is not known: None, shown "?", never a false 0;
+      the list has not been read yet: None.
+    waiting_engine keeps the engine's own number. waiting_note keeps the engine's own explanation of the row
+    (waiting_note_engine) and appends the app's (waiting_note_app) only when it adds a fact (second pass,
+    15 Sep: the first pass overwrote it on 14 of 16 rows). waiting_red, waiting_red_why: the engine flags
+    that lane's count as not matching, on the row itself or in the waiting() result by lane or session."""
+    items = [i for i in (items or []) if isinstance(i, dict)]
+    mismatches = mismatches or {}
+    out = []
+    for r in rows or []:
+        r = dict(r)
+        lane = r.get("lane").strip() if isinstance(r.get("lane"), str) else ""
+        sid = r.get("session_id")
+        mine, note = None, ""
+        if not list_read:
+            note = "the waiting list has not been read yet"
+        elif lane:
+            mine = [i for i in items if str(item_owner(i)).casefold() == lane.casefold()]
+        else:
+            owned = [i for i in items if sid and i.get("owner_session") == sid]
+            if owned or all(i.get("owner_session") for i in items):
+                mine = owned
+            else:
+                free = sum(1 for i in items if not i.get("owner_session"))
+                note = (f"this conversation is not matched to a lane, and {free} "
+                        f"{'item on the list has' if free == 1 else 'items on the list have'} no live owner")
+        r["waiting_engine"] = r.get("decisions_waiting")
+        if mine is None:
+            r.update(decisions_waiting=None, total_wait_seconds=None, waits_as_of=None)
+        else:
+            r.update(decisions_waiting=len(mine),
+                     total_wait_seconds=sum(int(_num(i.get("waited_seconds")) or 0) for i in mine), waits_as_of=as_of)
+        eng = one_line(r.get("waiting_note") or "")
+        r["waiting_note_engine"], r["waiting_note_app"] = eng, note
+        if not eng:
+            r["waiting_note"] = note
+        elif note and note_adds(eng, note):
+            r["waiting_note"] = f"{eng}; {note}"
+        else:
+            r["waiting_note"] = eng
+        red, why = False, ""
+        for key in MISMATCH_ROW_KEYS:
+            if key in r:
+                red, why = _flag_reason(r.get(key))
+                if red:
+                    break
+        if not red:
+            for k in ((("lane", lane.casefold()),) if lane else ()) + ((("session", str(sid)),) if sid else ()):
+                if k in mismatches:
+                    red, why = True, mismatches[k]
+                    break
+        r["waiting_red"], r["waiting_red_why"] = bool(red), (why if red else "")
+        out.append(r)
+    return out
+
+
+def _sentence(s):
+    s = one_line(s).rstrip(".")
+    return s + "." if s else ""
+
+
+def waiting_tip(n, red, why, note):
+    """The Waiting on you cell's tooltip: what the cell shows, then why. A "?" never claims a number was
+    counted (second pass, 15 Sep); a red count gives the engine's reason, and the engine's own row note when
+    the flag came with none; a plain count with a note (an unmatched row reading 0) explains it; a plain
+    count with nothing to say has no tooltip."""
+    why, note = one_line(why or ""), one_line(note or "")
+    flag = "The engine flags this lane's own count as not matching the waiting list"
+    if n is None:
+        tip = "Not known, shown as ?: " + _sentence(note or "the waiting list has not been read yet")
+        return tip + (f" {flag}{': ' + why if why else ''}." if red else "")
+    tip = f"Shown {n}, counted from the waiting list's items."
+    if red:
+        reason = why or note
+        tip += f" {flag}{': ' + reason if reason else ''}."
+        if why and note and note.casefold() not in why.casefold():
+            tip += " " + _sentence(note)
+        return tip
+    return tip + " " + _sentence(note) if note else None
+
+
+def reply_handoff(result):
+    """(handed off, ledger warning) for one reply result. Handed off: delivered or held (the outbox owns his
+    words) AND his words reached the ANSWERS ledger. Only then do his words leave the field; a failed,
+    refused or unanswered send, or a ledger that could not be written, keeps them (Phase 0 item 3)."""
+    r = result if isinstance(result, dict) else {}
+    warn = one_line(clean(r.get("ledger_error") or ""))
+    return (r.get("state") in ("delivered", "held") and not warn), warn
+
+
+def check_items(check, items, limit=CHECK_AT_ONCE):
+    """check(item) for every item, at most `limit` at a time from one queue (each check may start a Claude
+    process), the results in the items' order whatever order they finish in. A check that raises reads as open."""
+    items = list(items or [])
+    out = [None] * len(items)
+    if not items:
+        return out
+    q = queue_mod.Queue()
+    for k in range(len(items)):
+        q.put(k)
+
+    def work():
+        while True:
+            try:
+                k = q.get_nowait()
+            except queue_mod.Empty:
+                return
+            try:
+                out[k] = check(items[k])
+            except Exception:
+                out[k] = (False, "the check failed, treated as open", "the app")
+    ts = [threading.Thread(target=work, name="agents-check", daemon=True)
+          for _ in range(max(1, min(int(limit or 1), len(items))))]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    return out
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2115,6 +2328,7 @@ class Controller(NSObject):
         self.msg = {"phase": None, "outbox_id": None, "status": None, "status_t": 0.0, "text": ""}
         self.dock = {"phase": None, "card": None, "status": None, "status_t": 0.0, "draft": "", "iids": []}
         self.wmeta = {"ok": None, "sha": None, "as_of": None, "when": None, "err": None}
+        self.wmismatch = {}                # the engine's lane count mismatch flags (list_mismatches)
         self.store = None
         self.unjust, self.unjust_by_key, self.unjust_open = [], {}, False
         self.cmux_reason = None
@@ -2854,11 +3068,13 @@ class Controller(NSObject):
                 color = DIM if n == 0 else (TEXT_BRIGHT if ident == "running" else TEXT)
                 v.show(attr(str(n), FONT_NUM, color, P_RIGHT))
         elif ident == "waiting":
-            n = r.get("decisions_waiting")
+            n = r.get("decisions_waiting")                 # counted from the list's items (count_rows)
+            red = bool(r.get("waiting_red"))
+            tip = waiting_tip(n, red, r.get("waiting_red_why"), r.get("waiting_note"))   # what is shown, and why
             if n is None:
-                v.show(attr("?", FONT_NUM, DIM, P_RIGHT), "Not known yet: the waiting list has not been read.")
+                v.show(attr("?", FONT_NUM, RED if red else DIM, P_RIGHT), tip)
             else:
-                v.show(attr(str(n), FONT_NUM, DIM if n == 0 else TEXT, P_RIGHT))
+                v.show(attr(str(n), FONT_NUM, RED if red else (DIM if n == 0 else TEXT), P_RIGHT), tip)
         elif ident == "totalwait":
             s = total_wait_live(r, now)
             if s is None:
@@ -2870,7 +3086,7 @@ class Controller(NSObject):
     def apply_rows(self):
         """Sorted rows onto the table: changed rows redrawn in place; a new order reloads, keeping the
         selection by conversation. While a name is being edited the order is held still."""
-        new = sort_rows(self.raw_rows, self.sort_key, self.sort_reverse)
+        new = sort_rows(self.counted_rows(self.raw_rows), self.sort_key, self.sort_reverse)
         old = self.rows
         new_keys, old_keys = [conv_key(r) for r in new], [conv_key(r) for r in old]
         if self.renaming is not None and new_keys != old_keys:
@@ -2903,6 +3119,11 @@ class Controller(NSObject):
             else:
                 self.ctable.deselectAll_(None)
         self.empty_line.setHidden_(bool(self.rows))
+
+    @objc.python_method
+    def counted_rows(self, rows):
+        """The rows with their Waiting on you count taken from the list this window shows (count_rows)."""
+        return count_rows(rows, self.items, bool(self.wmeta.get("ok")), self.wmismatch, self.wmeta.get("as_of"))
 
     @objc.python_method
     def apply_top(self, rows, err, store, alarms, alarm_err, when):
@@ -3534,6 +3755,7 @@ class Controller(NSObject):
                 self.list_head.show(attr(f"The waiting list could not be read: {msg}.", FONT_HEADER_LINE, TEXT))
             return
         self.wmeta.update(ok=True, err=None, sha=w.get("sha"), as_of=w.get("as_of") or time.time(), when=when)
+        self.wmismatch = list_mismatches(w)
         self.list_head.show(self.header_attr(w))
         items = [i for i in (w.get("items") or []) if isinstance(i, dict) and i.get("id")]
         old_by_id = self.item_by_id
@@ -3553,6 +3775,8 @@ class Controller(NSObject):
         self.set_display(self.full_display(), changed)
         if changed_head:
             self.refresh_unjust()
+        if self.raw_rows:
+            self.apply_rows()          # each row's Waiting on you count comes from these items (count_rows)
 
     @objc.python_method
     def header_attr(self, w):
@@ -4000,8 +4224,9 @@ class Controller(NSObject):
         st = self.state(iid)
         if st.phase in ("checking", "sending", "card"):
             return
-        st.phase, st.draft, st.status = "checking", "", None
-        self.clear_field_for(iid)
+        # his words stay in the draft and the field (not editable meanwhile) until a confirmed hand-off (after_send)
+        st.phase, st.draft, st.status = "checking", text, None
+        self.release_field_for(iid)
         self.refresh_item(iid)
         item = dict(self.item_by_id[iid])
         act = self.actions()
@@ -4009,14 +4234,13 @@ class Controller(NSObject):
                 fallback=(False, "the check failed, treated as open", "the app"))
 
     @objc.python_method
-    def clear_field_for(self, iid):
+    def release_field_for(self, iid):
+        """Ends editing in the item's field. Its text stays: his words leave the field only after a
+        confirmed hand-off (after_send, reply_handoff)."""
         r = self.index.get(("i", iid))
         v = self.wtable.viewAtColumn_row_makeIfNecessary_(0, r, False) if r is not None else None
-        if v is not None:
-            f = v.box.field
-            if f.currentEditor() is not None:
-                self.window.makeFirstResponder_(None)
-            f.setStringValue_("")
+        if v is not None and v.box.field.currentEditor() is not None:
+            self.window.makeFirstResponder_(None)
 
     @objc.python_method
     def after_check(self, iids, text, results, docked):
@@ -4108,18 +4332,22 @@ class Controller(NSObject):
         now = time.time()
         seen = set()
         summary = []
+        warns = []
+        where = "the reply box above the list" if docked else "the field"
         for r in results or []:
+            r = r if isinstance(r, dict) else {}
             label = one_line(r.get("label") or r.get("lane") or "agent's")
             note = one_line(r.get("note") or "")
             state = r.get("state")
             reason = one_line(r.get("reason") or "")
+            handed, warn = reply_handoff(r)
+            if warn and warn not in warns:
+                warns.append(warn)
             for iid in r.get("items") or []:
                 seen.add(iid)
                 st = self.state(iid)
                 st.phase = None
                 st.status_t = now
-                if state in ("delivered", "held", "failed"):
-                    self.drop_draft(("item", iid))     # his words are in the ledger and the outbox now
                 if state == "delivered":
                     st.status = (f"Sent to the {label} window at {short_clock(now)}" + (f" ({note})" if note else "")
                                  + (" (TEST MODE: typed into the scratch window)" if TEST_WS else ""), "ok")
@@ -4129,14 +4357,22 @@ class Controller(NSObject):
                     st.status = (f"Not delivered to the {label} window: {reason}", "error")
                 else:
                     st.status = (f"Not sent: {reason}", "error")
-                    if not docked and not st.draft:
-                        st.draft = text                 # his words back in the field, never lost
+                if warn:                                # shown on the item, in the error colour, never ignored
+                    st.status = (f"{st.status[0].rstrip('. ')}. Warning: {warn}. Your words stay in {where}.", "error")
+                if handed:
+                    self.drop_draft(("item", iid))     # his words are in the ledger and the outbox now
+                    if not docked:
+                        st.draft = ""                   # a confirmed hand-off: only now do they leave the field
+                elif not docked and not st.draft:
+                    st.draft = text                     # his words stay in the field, never lost
             summary.append((state, label, len(r.get("items") or [])))
-        for iid in iids:
-            if iid not in seen:
-                st = self.state(iid)
-                st.phase = None
-                st.status = ("Not sent: no answer from the delivery", "error")
+        lost = [iid for iid in iids if iid not in seen]
+        for iid in lost:
+            st = self.state(iid)
+            st.phase = None
+            st.status = ("Not sent: no answer from the delivery", "error")
+            if not docked and not st.draft:
+                st.draft = text
         for iid in iids:
             self.refresh_item(iid)
         if docked:
@@ -4151,12 +4387,15 @@ class Controller(NSObject):
                 words.append(f"waiting to deliver to {', '.join(l for _, l, _ in held)}")
             if bad:
                 words.append(f"not sent to {', '.join(l for _, l, _ in bad)}")
-            self.dock["status"] = (("One reply, " + "; ".join(words) + f", at {short_clock(now)}.") if words else "Nothing was sent.",
-                                   "error" if bad else ("held" if held else "ok"))
+            line = ("One reply, " + "; ".join(words) + f", at {short_clock(now)}.") if words else "Nothing was sent."
+            if warns:
+                line += " Warning: " + "; ".join(warns) + ". Your words stay in the field."
+            self.dock["status"] = (line, "error" if (bad or warns or lost or not words) else ("held" if held else "ok"))
             self.dock["status_t"] = now
-            if bad and not delivered and not held and not self.dock["draft"]:
-                self.dock["draft"] = text
-            elif not bad and self.dock["card"] is None:
+            if bad or warns or lost or not words:
+                if not self.dock["draft"]:
+                    self.dock["draft"] = text           # not all handed off: his words stay in the field
+            elif self.dock["card"] is None:
                 self.dock["draft"] = ""
                 self.drop_draft(("dock",))
                 f = self.dock_box.field
@@ -4268,30 +4507,16 @@ class Controller(NSObject):
         ids = self.selected_item_ids()
         if len(ids) < 2 or not (text or "").strip() or self.dock["phase"] is not None or self.dock["card"] is not None:
             return
-        self.dock.update(phase="checking", iids=list(ids), draft="", status=None)
+        # his words stay in the draft and the field (not editable meanwhile) until a confirmed hand-off (after_send)
+        self.dock.update(phase="checking", iids=list(ids), draft=text, status=None)
         f = self.dock_box.field
         if f.currentEditor() is not None:
             self.window.makeFirstResponder_(None)
-        f.setStringValue_("")
         self.layout_bottom()
         items = [dict(self.item_by_id[i]) for i in ids]
         act = self.actions()
-
-        def check_all():
-            out = [None] * len(items)
-
-            def one(k):
-                try:
-                    out[k] = act.check_resolved(items[k])
-                except Exception:
-                    out[k] = (False, "the check failed, treated as open", "the app")
-            ts = [threading.Thread(target=one, args=(k,), daemon=True) for k in range(len(items))]
-            for t in ts:
-                t.start()
-            for t in ts:
-                t.join()
-            return out
-        self.bg(check_all, lambda res: self.after_check(ids, text, res, docked=True),
+        # one queue, at most CHECK_AT_ONCE checks (Claude processes) at a time, results back in the items' order
+        self.bg(lambda: check_items(act.check_resolved, items), lambda res: self.after_check(ids, text, res, docked=True),
                 fallback=[(False, "the check failed, treated as open", "the app")] * len(ids))
 
     # ---- the message bar (SPEC section 8) --------------------------------------------------------------
@@ -5337,22 +5562,24 @@ def run_check():
                 "over": over, "ok": not over, "code": False}
 
     rows = [
-        {"title": "WORKFLOW", "tty": "ttys001", "session_id": "s1", "working": True, "ticking": True, "seconds_working": 1000,
+        # lanes: the Waiting on you count is counted from the list's items by lane (count_rows); WORKFLOW's 3 are
+        # i1 (a stack item, the coordinator's) and i19, i20; Clip's 1 is i2; EQ has no lane and stays unknown.
+        {"title": "WORKFLOW", "lane": "coordinator", "tty": "ttys001", "session_id": "s1", "working": True, "ticking": True, "seconds_working": 1000,
          "time_text": "16 m", "last_entry_ts": now - 10, "running_now": 1, "tasks_run": 5,
          "headline": headline("Waiting on you: pick **one**."), "summary": headline("The **plan** is ready.", 200),
          "waiting_on_you": True, "decisions_waiting": 3, "total_wait_seconds": 600, "waits_as_of": now,
          "full_text": "Waiting on you: pick one.\n\n- a\n- b", "full_text_ts": now - 90, "text_source": "transcript", "note": ""},
-        {"title": "Clip", "tty": "ttys002", "session_id": "s2", "working": False, "ticking": False, "seconds_working": 5000,
+        {"title": "Clip", "lane": "clip", "tty": "ttys002", "session_id": "s2", "working": False, "ticking": False, "seconds_working": 5000,
          "time_text": "1 h 23 m", "last_entry_ts": now - 100, "running_now": 0, "tasks_run": 10,
          "headline": headline("A very long first line \u2014 with an em dash, that runs past fifty visible characters.", over=True),
          "summary": headline("x" * 230, 200, over=True), "waiting_on_you": False, "decisions_waiting": 1,
          "total_wait_seconds": 100, "waits_as_of": now, "full_text": "Long.", "full_text_ts": None,
          "text_source": "lane status", "note": ""},
-        {"title": "EQ", "tty": "ttys003", "session_id": "s3", "working": None, "ticking": None, "seconds_working": 0, "time_text": "",
+        {"title": "EQ", "lane": None, "tty": "ttys003", "session_id": "s3", "working": None, "ticking": None, "seconds_working": 0, "time_text": "",
          "last_entry_ts": None, "running_now": None, "tasks_run": None, "headline": None, "summary": None,
          "description": "", "waiting_on_you": False, "decisions_waiting": None, "total_wait_seconds": None,
          "waits_as_of": None, "note": "no transcript could be read"},
-        {"title": "Beta", "tty": "ttys004", "session_id": "s4", "working": False, "ticking": False, "seconds_working": 200,
+        {"title": "Beta", "lane": "beta", "tty": "ttys004", "session_id": "s4", "working": False, "ticking": False, "seconds_working": 200,
          "time_text": "3 m", "last_entry_ts": now - 5000, "running_now": 0, "tasks_run": 2,
          "headline": headline("Done."), "summary": headline("Done.", 200), "waiting_on_you": False,
          "decisions_waiting": 0, "total_wait_seconds": 0, "waits_as_of": now, "full_text": "Done.",
@@ -5369,7 +5596,7 @@ def run_check():
     items = [item(1, "stack", "coordinator"), item(2, "clip", "clip", True), item(3, "eq", "eq"),
              item(4, "eq", "eq", True), item(5, "sampler", "sampler"), item(6, "midi", "midi"),
              item(7, "level", "level"), item(8, "midi", "midi")]
-    items += [item(k, "comp", "comp") for k in range(9, 21)]      # enough below, so the list can keep its place
+    items += [item(k, "comp", "coordinator" if k >= 19 else "comp") for k in range(9, 21)]   # enough below, so the list can keep its place
     unjust = [{"key": "u000000001", "lane": "eq", "field": "next", "text": "WAITING ON MASON: say go \u2014 now"},
               {"key": "u000000002", "lane": "clip", "field": "blocked", "text": "WAITING ON MASON: pick the knob"},
               {"key": "u000000003", "lane": "sampler", "field": "next", "text": "WAITING ON MASON: " + "a long line " * 30}]
@@ -5383,17 +5610,33 @@ def run_check():
             self.resolved = {"i3": "answered in chat \u2014 on 9 Sep"}
             self.msg_result = {"state": "held", "reason": "the window shows a permission question",
                                "outbox_id": "ob1", "ledger_error": ""}
+            self.reply_state, self.reply_ledger_error = "delivered", ""     # controls 25 and 26
+            self.on_check, self.delay = None, 0.0                           # controls 25 and 27
+            self.active = self.peak = 0
+            self.lock = threading.Lock()
 
         def check_resolved(self, it):
-            self.calls.append(("check", it["id"]))
-            if it["id"] in self.resolved:
-                return True, self.resolved[it["id"]], "Claude Haiku 4.5"
-            return False, "", "Claude Haiku 4.5"
+            with self.lock:
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+            try:
+                self.calls.append(("check", it["id"]))
+                if self.on_check is not None:
+                    self.on_check(it)
+                if self.delay:
+                    time.sleep(self.delay)
+                if it["id"] in self.resolved:
+                    return True, self.resolved[it["id"]], "Claude Haiku 4.5"
+                return False, "", "Claude Haiku 4.5"
+            finally:
+                with self.lock:
+                    self.active -= 1
 
         def reply(self, its, text):
             self.calls.append(("reply", [i["id"] for i in its], text))
-            return [{"state": "delivered", "reason": "delivered", "items": [i["id"] for i in its], "label": "Clip",
-                     "lane": "clip", "note": "", "outbox_id": "x"}]
+            return [{"state": self.reply_state, "reason": "delivered" if self.reply_state == "delivered" else "planted failure",
+                     "items": [i["id"] for i in its], "label": "Clip", "lane": "clip", "note": "", "outbox_id": "x",
+                     "ledger_error": self.reply_ledger_error}]
 
         def message_coordinator(self, text):
             self.calls.append(("msg", text))
@@ -5996,6 +6239,327 @@ def run_check():
           got24 == want24 and sab24 != want24 and tgt24[0] is None and not calls24 and "Not renamed" in foot24
           and "every send and rename is refused" in hint24,
           f"{got24}; rename target {tgt24}; calls {calls24}; footer {foot24[-70:]!r}")
+
+    # 25 to 28: REDESIGN-PLAN.md Phase 0 (SPEC section 0 item 17). Each is a planted case the old code fails; where
+    # the old behaviour sits in one function it is planted back as sabotage and the control must then fail.
+    win.makeFirstResponder_(None)
+    ctl.wtable.deselectAll_(None)
+    ctl.apply_waiting(wfull, None, "10:03:00 PM")
+    ctl.layout_bottom()
+
+    def p0_note(field):
+        return type("N", (), {"object": lambda self: field})()
+
+    def p0_field(iid):
+        return ctl.wtable.viewAtColumn_row_makeIfNecessary_(0, ctl.index[("i", iid)], True).box.field
+
+    def p0_select(ids_):
+        ix = NSMutableIndexSet.indexSet()
+        for i_ in ids_:
+            ix.addIndex_(ctl.index[("i", i_)])
+        ctl.wtable.selectRowIndexes_byExtendingSelection_(ix, False)
+        ctl.layout_bottom()
+
+    def p0_reset(ids_=()):
+        for i_ in ids_:
+            s_ = ctl.state(i_)
+            s_.draft, s_.status, s_.phase, s_.card = "", None, None, None
+            ctl.drop_draft(("item", i_))
+            ctl.refresh_item(i_)
+        ctl.dock.update(phase=None, card=None, status=None, draft="", iids=[])
+        ctl.drop_draft(("dock",))
+        ctl.dock_box.field.setStringValue_("")
+        ctl.wtable.deselectAll_(None)
+        ctl.layout_bottom()
+        fake.reply_state, fake.reply_ledger_error, fake.on_check, fake.delay = "delivered", "", None, 0.0
+
+    # 25: fix 1 (submit_item, submit_dock). His words stay in the draft and the field while the already-resolved
+    # check runs (the old code cleared both first) and after a send that fails; only a confirmed hand-off clears them.
+    p0_reset(["i6", "i7", "i8"])
+    fake.calls.clear()
+    during25 = []
+    fake.on_check = lambda it: during25.append((ctl.state(it["id"]).draft, str(p0_field(it["id"]).stringValue())))
+    f25 = p0_field("i6")
+    f25.setStringValue_("my words")
+    ctl.controlTextDidChange_(p0_note(f25))
+    fake.reply_state = "failed"
+    ctl.submit_item("i6", "my words")
+    failed25 = (ctl.state("i6").draft, str(p0_field("i6").stringValue()), (ctl.state("i6").status or ("", ""))[1])
+    fake.reply_state = "delivered"
+    ctl.submit_item("i6", "my words")
+    sent25 = (ctl.state("i6").draft, str(p0_field("i6").stringValue()), (ctl.state("i6").status or ("", ""))[1])
+    p0_reset(["i6"])
+    dock_during25 = []
+    fake.on_check = lambda it: dock_during25.append(ctl.dock["draft"])     # a worker thread: plain Python state only
+    p0_select(["i7", "i8"])
+    ctl.dock_box.field.setStringValue_("both of you")
+    ctl.controlTextDidChange_(p0_note(ctl.dock_box.field))
+    fake.reply_state = "refused"
+    ctl.submit_dock("both of you")
+    ctl.layout_bottom()
+    dock_failed25 = (ctl.dock["draft"], str(ctl.dock_box.field.stringValue()), (ctl.dock_status_text() or ("", ""))[1])
+    fake.reply_state = "delivered"
+    ctl.submit_dock("both of you")
+    ctl.layout_bottom()
+    dock_sent25 = (ctl.dock["draft"], str(ctl.dock_box.field.stringValue()))
+    replies25 = [c for c in fake.calls if c[0] == "reply"]
+    p0_reset(["i6", "i7", "i8"])
+    check("fix 1: his words stay in the draft and the field while the resolved check runs and after a failed or refused "
+          "send, for one item and for several at once; a confirmed hand-off clears them",
+          during25 == [("my words", "my words"), ("my words", "my words")] and failed25 == ("my words", "my words", "error")
+          and sent25 == ("", "", "ok") and dock_during25 == ["both of you"] * 4
+          and dock_failed25 == ("both of you", "both of you", "error") and dock_sent25 == ("", "") and len(replies25) == 4,
+          f"during {during25}, failed {failed25}, sent {sent25}, dock during {dock_during25}, dock failed {dock_failed25}, "
+          f"dock sent {dock_sent25}, {len(replies25)} replies")
+
+    # 26: fix 2 (after_send). A reply whose result carries ledger_error: a warning on that item (and the dock) in the
+    # error colour, and his words kept. Sabotage: the old after_send, which ignored ledger_error.
+    ledger26 = "his words could not be written to the ANSWERS ledger (planted: No space left on device)"
+
+    def run26():
+        p0_reset(["i6", "i7", "i8"])
+        fake.reply_ledger_error = ledger26
+        f_ = p0_field("i6")
+        f_.setStringValue_("record me")
+        ctl.controlTextDidChange_(p0_note(f_))
+        ctl.submit_item("i6", "record me")
+        s_item = ctl.item_status("i6") or ("", "", None)
+        kept_item = (ctl.state("i6").draft, str(p0_field("i6").stringValue()))
+        p0_select(["i7", "i8"])
+        fake.reply_ledger_error = ledger26
+        ctl.dock_box.field.setStringValue_("record both")
+        ctl.controlTextDidChange_(p0_note(ctl.dock_box.field))
+        ctl.submit_dock("record both")
+        ctl.layout_bottom()
+        s_dock = ctl.dock_status_text() or ("", "")
+        kept_dock = (ctl.dock["draft"], str(ctl.dock_box.field.stringValue()))
+        s7 = ctl.item_status("i7") or ("", "", None)
+        out_ = {"item": s_item[:2], "kept_item": kept_item, "dock": tuple(s_dock[:2]), "kept_dock": kept_dock, "i7": s7[:2]}
+        p0_reset(["i6", "i7", "i8"])
+        return out_
+
+    def ok26(r_):
+        return (r_["item"][1] == "error" and r_["item"][0].startswith("Sent to the Clip window") and ledger26 in r_["item"][0]
+                and "Your words stay in the field." in r_["item"][0] and r_["kept_item"] == ("record me", "record me")
+                and r_["dock"][1] == "error" and ledger26 in r_["dock"][0] and r_["kept_dock"] == ("record both", "record both")
+                and r_["i7"][1] == "error" and ledger26 in r_["i7"][0] and STATUS_COLORS["error"] == RED)
+    r26 = run26()
+    shown += [r26["item"][0], r26["dock"][0], r26["i7"][0]]
+    real_handoff = reply_handoff
+    globals()["reply_handoff"] = lambda res: ((res or {}).get("state") in ("delivered", "held"), "")
+    try:
+        sab26 = run26()
+    finally:
+        globals()["reply_handoff"] = real_handoff
+    check("fix 2: a ledger_error on a reply result shows a warning on that item and the dock in the red error colour and "
+          "keeps his words; sabotage (ledger_error ignored) makes it fail",
+          ok26(r26) and not ok26(sab26), f"item {r26['item']}, kept {r26['kept_item']}, dock {r26['dock'][1]}, "
+          f"sabotaged item {sab26['item']}, sabotaged kept {sab26['kept_item']}")
+
+    # 27: fix 3 (submit_dock). Six items at once: at most CHECK_AT_ONCE checks run at one time from one queue, every
+    # item checked once, results paired with their own item. Sabotage: the old one thread per item.
+    ids27 = ["i1", "i3", "i4", "i5", "i6", "i7"]
+
+    def run27():
+        p0_reset(ids27)
+        fake.calls.clear()
+        fake.peak, fake.delay = 0, 0.06
+        p0_select(ids27)
+        ctl.submit_dock("six at once")
+        out_ = {"peak": fake.peak, "checks": sorted(c[1] for c in fake.calls if c[0] == "check"),
+                "replies": [c for c in fake.calls if c[0] == "reply"],
+                "card": [(r_[0], r_[1]) for r_ in (ctl.dock["card"] or {}).get("rows", [])]}
+        p0_reset(ids27)
+        return out_
+    r27 = run27()
+    scrambled = check_items(lambda k: (time.sleep(0.004 * (8 - k)), ("r", k))[1], list(range(8)))
+    raised = check_items(lambda k: 1 / 0, [1])
+
+    def old_check_all(check_, items_, limit=None):
+        out_ = [None] * len(items_)
+
+        def one(k):
+            out_[k] = check_(items_[k])
+        ts_ = [threading.Thread(target=one, args=(k,), daemon=True) for k in range(len(items_))]
+        for t_ in ts_:
+            t_.start()
+        for t_ in ts_:
+            t_.join()
+        return out_
+    real_check_items = check_items
+    globals()["check_items"] = old_check_all
+    try:
+        sab27 = run27()
+    finally:
+        globals()["check_items"] = real_check_items
+    check("fix 3: answering 6 at once runs at most 2 checks at a time from one queue, each item once, each result "
+          "paired with its own item (finishing order scrambled); sabotage (one thread per item) makes it fail",
+          CHECK_AT_ONCE == 2 and 1 <= r27["peak"] <= CHECK_AT_ONCE and r27["checks"] == sorted(ids27)
+          and r27["replies"] == [("reply", ["i1", "i4", "i5", "i6", "i7"], "six at once")]
+          and r27["card"] == [("i3", fake.resolved["i3"])] and scrambled == [("r", k) for k in range(8)]
+          and raised == [(False, "the check failed, treated as open", "the app")] and sab27["peak"] > CHECK_AT_ONCE,
+          f"peak {r27['peak']}, checks {len(r27['checks'])}, replies {r27['replies']}, card {r27['card']}, "
+          f"sabotaged peak {sab27['peak']}")
+
+    # 28: fix 4 (the Waiting on you cell). The count comes from the list's items for that lane, not the number the
+    # row carries; "?" when it cannot be known; red on the engine's mismatch flag; it follows a new list without a
+    # new table refresh; the sort reads the same count. Sabotage: the rows' own numbers (the old cell).
+    def p28_item(k, owner, session="", waited=600):
+        return {"id": f"p{k}", "lane": owner, "owner_lane": owner, "owner_session": session, "bucket": "decision",
+                "needs": "decide", "yellow": False, "text": f"Planted ask {k} for {owner}.", "waiting_since": now - waited,
+                "waited_seconds": waited, "wait_at_least": False, "may_be_settled": False, "settled_reason": ""}
+    items28 = ([p28_item(k, "level", waited=1000 * k) for k in range(1, 5)]
+               + [p28_item(5, "clip", "s12"), p28_item(6, "coordinator"), p28_item(7, "coordinator")])
+
+    def p28_row(title, tty, sid, lane, typed, **kw):
+        return dict(rows[3], title=title, tty=tty, session_id=sid, lane=lane, decisions_waiting=typed, total_wait_seconds=0,
+                    waits_as_of=now, waiting_on_you=False, **kw)
+    rows28 = [p28_row("Leveller", "ttys010", "s10", "level", 0),
+              p28_row("Clip helper", "ttys012", "s12", None, 0, waiting_mismatch={"reason": "planted row flag"}),
+              p28_row("Unmatched", "ttys013", "s13", None, 0),
+              p28_row("Beta lane", "ttys014", "s14", "beta", 0)]
+    w28 = {"ok": True, "total": 7, "counts": {"decision": 7}, "sha": "p28", "items": items28, "as_of": now,
+           "unjustified": [], "unjustified_total": 0, "waiting_mismatches": {"level": "its status file says 0, the list shows 4"}}
+    names28 = ["Leveller", "Clip helper", "Unmatched", "Beta lane"]
+
+    def run28():
+        c6 = Controller.alloc().init()
+        c6.act, c6.sync_bg = fake, True
+        c6.build_window(remember=False)
+        c6.group_done.update({"p28", "p28b"})
+        c6.apply_top(rows28, None, None, [], None, "10:05:00 PM")
+
+        def cell6(title):
+            col_ = c6.ctable.tableColumns()[c6.ctable.columnWithIdentifier_("waiting")]
+            return c6.tableView_viewForTableColumn_row_(c6.ctable, col_, [r_["title"] for r_ in c6.rows].index(title))
+
+        def red6(title):
+            v_ = cell6(title)
+            return v_.text_attr.attribute_atIndex_effectiveRange_(NSForegroundColorAttributeName, 0, None)[0] == RED
+        out_ = {"before": cell6("Leveller").plain()}
+        c6.apply_waiting(w28, None, "10:05:01 PM")
+        out_["got"] = [cell6(t).plain() for t in names28]
+        out_["red"] = [red6(t) for t in names28]
+        out_["tip_unknown"] = str(cell6("Unmatched").toolTip() or "")
+        out_["tip_red"] = str(cell6("Leveller").toolTip() or "")
+        out_["total"] = next(r_ for r_ in c6.rows if r_["title"] == "Leveller").get("total_wait_seconds")
+        c6.sort_key = "decisions"
+        c6.apply_rows()
+        out_["order"] = [r_["title"] for r_ in c6.rows]
+        c6.sort_key = "sidebar"
+        c6.apply_rows()
+        c6.apply_waiting(dict(w28, sha="p28b", total=5, items=[i_ for i_ in items28 if i_["id"] not in ("p1", "p2")]),
+                         None, "10:05:31 PM")
+        out_["fewer"] = cell6("Leveller").plain()
+        c6.window.setDelegate_(None)
+        return out_
+
+    def ok28(r_):
+        return (r_["before"] == "?" and r_["got"] == ["4", "1", "?", "0"] and r_["red"] == [True, True, False, False]
+                and "no live owner" in r_["tip_unknown"] and "the list shows 4" in r_["tip_red"] and r_["total"] == 10000
+                and r_["order"] == ["Leveller", "Clip helper", "Beta lane", "Unmatched"] and r_["fewer"] == "2")
+    r28 = run28()
+    shown += r28["got"] + [r28["tip_unknown"], r28["tip_red"]]
+    real_count_rows = count_rows
+    globals()["count_rows"] = lambda rows_, *a, **k: [dict(r_) for r_ in (rows_ or [])]
+    try:
+        sab28 = run28()
+    finally:
+        globals()["count_rows"] = real_count_rows
+    check("fix 4: Waiting on you is counted from the list's items for the lane (4, not the row's 0), by session when "
+          "there is no lane, '?' when unknowable, red on the engine's mismatch flag, follows a new list, sorts by the "
+          "same count; sabotage (the row's own number) makes it fail",
+          ok28(r28) and not ok28(sab28),
+          f"before {r28['before']!r}, cells {r28['got']}, red {r28['red']}, total {r28['total']}, order {r28['order']}, "
+          f"after fewer {r28['fewer']!r}; sabotaged cells {sab28['got']}")
+
+    # 29: the second pass's loose ends B and C (15 Sep). The engine's per-row note survives count_rows and reaches
+    # the tooltip; the app's own note is appended only when it adds a fact; the engine's mismatch_lanes key turns
+    # the lane's row red with the engine's reason; a "?" cell's tooltip says what is shown and why, never that a
+    # number was counted. Sabotage: the old count_rows (note overwritten), the old key list (mismatch_lanes unread),
+    # the old tooltip (a "?" told it was counted).
+    eng_ghost = ("its session is in no roster.json row, so no item of the list can reach this row, and 2 items on "
+                 "the list have no live owner, so its count is not known")
+    rows29 = [p28_row("Leveller", "ttys010", "s10", "level", 0, waiting_mismatch=True,
+                      waiting_note="4 on the list, but its headline says 5"),
+              p28_row("Ghost", "ttys013", "s13", None, 0, waiting_mismatch=False, waiting_note=eng_ghost),
+              p28_row("Fresh", "ttys015", "s15", None, 0, waiting_mismatch=False, waiting_note=""),
+              p28_row("Beta lane", "ttys014", "s14", "beta", 0, waiting_mismatch=False, waiting_note="")]
+    w29 = {"ok": True, "total": 7, "counts": {"decision": 7}, "sha": "p29", "items": items28, "as_of": now,
+           "unjustified": [], "unjustified_total": 0, "mismatch_lanes": ["beta"],
+           "lanes": {"beta": {"items": 0, "typed": [{"where": "status headline", "said": 2, "words": "two asks"}],
+                              "mismatch": True},
+                     "level": {"items": 4, "typed": [], "mismatch": False}}}
+    names29 = ["Leveller", "Ghost", "Fresh", "Beta lane"]
+
+    def run29():
+        c9 = Controller.alloc().init()
+        c9.act, c9.sync_bg = fake, True
+        c9.build_window(remember=False)
+        c9.group_done.add("p29")
+        c9.apply_top(rows29, None, None, [], None, "10:06:00 PM")
+        c9.apply_waiting(w29, None, "10:06:01 PM")
+
+        def cell9(title):
+            col_ = c9.ctable.tableColumns()[c9.ctable.columnWithIdentifier_("waiting")]
+            return c9.tableView_viewForTableColumn_row_(c9.ctable, col_, [r_["title"] for r_ in c9.rows].index(title))
+
+        def red9(title):
+            v_ = cell9(title)
+            return v_.text_attr.attribute_atIndex_effectiveRange_(NSForegroundColorAttributeName, 0, None)[0] == RED
+        out_ = {"cells": [cell9(t).plain() for t in names29], "red": [red9(t) for t in names29],
+                "tips": {t: str(cell9(t).toolTip() or "") for t in names29},
+                "notes": {r_["title"]: r_.get("waiting_note") or "" for r_ in c9.rows}}
+        c9.window.setDelegate_(None)
+        return out_
+
+    def ok29(r_):
+        t_ = r_["tips"]
+        return (r_["cells"] == ["4", "?", "?", "0"] and r_["red"] == [True, False, False, True]
+                and r_["notes"]["Leveller"] == "4 on the list, but its headline says 5"            # kept, not overwritten
+                and r_["notes"]["Ghost"] == eng_ghost                                              # the app's adds nothing
+                and r_["notes"]["Fresh"].startswith("this conversation is not matched to a lane")  # the app's, alone
+                and "its headline says 5" in t_["Leveller"]                                        # the engine's reason on the red
+                and "status headline says 2" in t_["Beta lane"] and "0 on the list" in t_["Beta lane"]
+                and all(t_[n].startswith("Not known, shown as ?") for n in ("Ghost", "Fresh"))
+                and not any("counted from the list" in t_[n] for n in ("Ghost", "Fresh"))
+                and t_["Ghost"].count("no live owner") == 1 and "no roster.json row" in t_["Ghost"])
+    r29 = run29()
+    shown += r29["cells"] + list(r29["tips"].values()) + list(r29["notes"].values())
+    sab29 = {}
+    real_cr29 = count_rows
+
+    def old_count_rows(rows_, *a, **k):                       # sabotage 1: the first pass, the app's note overwrites the engine's
+        out_ = real_cr29(rows_, *a, **k)
+        for r_ in out_:
+            r_["waiting_note"] = r_["waiting_note_app"]
+        return out_
+    globals()["count_rows"] = old_count_rows
+    try:
+        sab29["note overwritten"] = run29()
+    finally:
+        globals()["count_rows"] = real_cr29
+    real_keys29 = MISMATCH_LIST_KEYS
+    globals()["MISMATCH_LIST_KEYS"] = tuple(k for k in real_keys29 if k != "mismatch_lanes")   # sabotage 2: the engine's key unread
+    try:
+        sab29["mismatch_lanes unread"] = run29()
+    finally:
+        globals()["MISMATCH_LIST_KEYS"] = real_keys29
+    real_tip29 = waiting_tip
+    globals()["waiting_tip"] = lambda n, red, why, note: (                                    # sabotage 3: the first pass's tooltip
+        "The engine flags this lane's own count as not matching the waiting list. The number shown is counted from the list."
+        if red else (one_line(note or "") or "Not known yet: the waiting list has not been read."))
+    try:
+        sab29["the old ? tooltip"] = run29()
+    finally:
+        globals()["waiting_tip"] = real_tip29
+    failed29 = [k for k, s in sab29.items() if not ok29(s)]
+    check("fix 5: the engine's row note is kept and reaches the tooltip, the app's note is added only when it adds a fact, "
+          "the engine's mismatch_lanes key turns the lane red with the engine's reason, and a ? cell says what is shown "
+          "and why; sabotage (note overwritten; mismatch_lanes unread; the old ? tooltip) makes it fail",
+          ok29(r29) and len(failed29) == 3,
+          f"cells {r29['cells']}, red {r29['red']}, Leveller tip {r29['tips']['Leveller']!r}, Ghost tip {r29['tips']['Ghost']!r}, "
+          f"Beta tip {r29['tips']['Beta lane']!r}, Fresh note {r29['notes']['Fresh']!r}; sabotaged {failed29} fail")
 
     # 20: no em dash anywhere shown
     shown += [ctl.foot.plain(), ctl.list_head.plain(), ctl.storage_strip.plain()]

@@ -23,8 +23,12 @@ PUBLIC FUNCTIONS (every one returns, none raises to the caller)
       pump()), "refused" (nothing was written or typed: test mode, an empty text, no window named)
       or "failed" (needs him: part of the text may be in the window). ledger is a list of
       (subject, how, his words) rows written to the day's ANSWERS ledger BEFORE anything is typed,
-      so his words land even when delivery does not. text is the exact message; newlines in it
-      become " / " on the wire (a newline would press Enter in the agent's prompt).
+      so his words land even when delivery does not. When the ledger cannot be written, nothing is
+      typed: state "refused" with ledger_error saying why (15 Sep). text is the exact message; a text
+      with a line break in it (other than at its very start or end) is never typed, because a newline
+      presses Enter in the agent's prompt and no route that keeps the break has been measured: it is
+      kept, state "failed", reason MULTILINE_REASON, his words already in the ledger as written.
+      Until 15 Sep line breaks became " / ", which changed his words without saying so.
       Blocks for about a second (read-screen, send, a pause, a second read-screen, Enter, a
       confirming read): call it off the main thread.
 
@@ -515,9 +519,31 @@ def _box_text(text, long=False):
     return re.sub(r"\s+", "", lines[prompt][len(PROMPT_GLYPH):] + "".join(lines[prompt + 1:bottom]))
 
 
+def _box_holds(first, rest, typed):
+    """True when the box's lines hold exactly the typed text. first: the prompt line after the glyph;
+    rest: the continuation lines. The box wraps at the window's width with a two-space hanging indent,
+    and read-screen drops the spaces at each line's end, so each line is compared exactly, spaces
+    inside it included, and only where one line wraps into the next may the typed text hold spaces the
+    screen does not show. Until 15 Sep every space was removed on both sides first, so "ab" in the box
+    passed for a typed "a b" (GPT-5.6 Sol review)."""
+    want = (typed or "").replace(" ", " ").strip()
+    segs = [s for s in (x.replace(" ", " ").strip() for x in [first] + list(rest)) if s]
+    if not want or not segs:
+        return False
+    i = 0
+    for k, seg in enumerate(segs):
+        if k:
+            while i < len(want) and want[i] == " ":
+                i += 1
+        if not want.startswith(seg, i):
+            return False
+        i += len(seg)
+    return i == len(want)
+
+
 def check_typed(text, typed):
     """The check after typing (SPEC section 11): (ok, why, box). ok only when the box holds exactly
-    the typed text (whitespace ignored, since wrapping breaks lines anywhere) and no permission
+    the typed text (spaces count, except where the box wraps a line: see _box_holds) and no permission
     question, menu or list shows, by the same dialog scan classify_screen runs before typing.
     box: "ours", "empty" (nothing, or only Claude's placeholder), "other" or "none" (no box)."""
     lines = _lines(text)
@@ -532,9 +558,9 @@ def check_typed(text, typed):
                 start = k + 1
                 break
         region = lines[start:top] + lines[bottom + 1:]
-        got = re.sub(r"\s+", "", lines[prompt][len(PROMPT_GLYPH):] + "".join(lines[prompt + 1:bottom]))
-        want = re.sub(r"\s+", "", typed or "")
-        if got == want and want:
+        first, rest = lines[prompt][len(PROMPT_GLYPH):], lines[prompt + 1:bottom]
+        got = re.sub(r"\s+", "", first + "".join(rest))
+        if _box_holds(first, rest, typed):
             state = "ours"
         elif not got or _PLACEHOLDER.match(got):
             state = "empty"
@@ -558,13 +584,21 @@ def check_typed(text, typed):
 # The wire: text as cmux send must receive it
 # ---------------------------------------------------------------------------------------------
 
+LINE_BREAK_RE = re.compile("\r\n|[\n\r\u2028\u2029\u0085\x0b\x0c]")
+MULTILINE_REASON = ("not sent: the reply has more than one line, and a line break typed into Claude's prompt "
+                    "presses Enter and sends the first line alone; his words are in the ANSWERS ledger as "
+                    "written; send it again as one line")
+
+
 def flatten(text):
-    """One line. Newlines become " / " (a newline presses Enter in Claude's prompt and would send
-    the first line alone); tabs become spaces; other control characters are dropped."""
-    t = (text or "").replace("\r\n", "\n").replace("\r", "\n")
-    t = " / ".join(part.strip() for part in t.split("\n") if part.strip()) if "\n" in t else t
-    t = t.replace("\t", " ")
-    return "".join(ch for ch in t if ch >= " " or ch == "\u00a0")
+    """The wire text. Line breaks are KEPT, each as one "\\n" (CR LF, CR and the Unicode line and
+    paragraph separators included), never joined into one line: until 15 Sep they became " / ", which
+    changed his words without saying so. A text still holding a line break is never typed (_submit
+    holds it with MULTILINE_REASON), because a newline presses Enter in Claude's prompt and no route
+    that keeps a break has been measured on a live window. Tabs become spaces; other control
+    characters are dropped."""
+    t = LINE_BREAK_RE.sub("\n", text or "").replace("\t", " ")
+    return "".join(ch for ch in t if ch >= " " or ch in ("\n", "\u00a0"))
 
 
 def wire_chunks(text):
@@ -752,6 +786,7 @@ def ledger_append(rows, now=None):
 # ---------------------------------------------------------------------------------------------
 
 _LOCK = threading.RLock()
+_OUTBOX_DEPTH = [0]                    # how deep this process holds the outbox lock (guarded by _LOCK)
 
 
 def test_outbox_name(ws):
@@ -767,38 +802,59 @@ def _outbox_path():
 
 class _OutboxLock:
     """One writer at a time across threads and processes (two app instances must never both type
-    the same held message)."""
+    the same held message). Re-entrant: flock belongs to an open file, so a second LOCK_EX from a
+    new file in this same process would wait on itself forever; only the outermost holder opens and
+    locks the lock file, inner holders count depth under _LOCK."""
 
     def __enter__(self):
         _LOCK.acquire()
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        self.fh = open(_outbox_path() + ".lock", "a")
-        fcntl.flock(self.fh, fcntl.LOCK_EX)
+        self.fh = None
+        try:
+            if _OUTBOX_DEPTH[0] == 0:
+                os.makedirs(CACHE_DIR, exist_ok=True)
+                fh = open(_outbox_path() + ".lock", "a")
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX)
+                except BaseException:
+                    fh.close()
+                    raise
+                self.fh = fh
+            _OUTBOX_DEPTH[0] += 1
+        except BaseException:
+            _LOCK.release()
+            raise
         return self
 
     def __exit__(self, *a):
         try:
-            fcntl.flock(self.fh, fcntl.LOCK_UN)
-            self.fh.close()
+            _OUTBOX_DEPTH[0] -= 1
+            if self.fh is not None:
+                fcntl.flock(self.fh, fcntl.LOCK_UN)
+                self.fh.close()
         finally:
             _LOCK.release()
 
 
 def _load_outbox():
-    try:
-        with open(_outbox_path()) as fh:
-            d = json.load(fh)
-        return d if isinstance(d, list) else []
-    except (OSError, ValueError):
-        return []
+    """Under the outbox lock (15 Sep): a read never sees another process's half-finished change."""
+    with _OutboxLock():
+        try:
+            with open(_outbox_path()) as fh:
+                d = json.load(fh)
+            return d if isinstance(d, list) else []
+        except (OSError, ValueError):
+            return []
 
 
 def _save_outbox(entries):
-    path = _outbox_path()
-    tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w") as fh:
-        json.dump(entries, fh, indent=1)
-    os.replace(tmp, path)
+    """Under the outbox lock (15 Sep). Until then a caller outside _OutboxLock could replace the file
+    while another process was between its read and its write, and one of the two changes was lost."""
+    with _OutboxLock():
+        path = _outbox_path()
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as fh:
+            json.dump(entries, fh, indent=1)
+        os.replace(tmp, path)
 
 
 def _put(entry):
@@ -932,20 +988,28 @@ def _hold_typed(entry, ws, surface, why, box):
 
 
 def _press_enter(entry, ws, surface):
-    """Enter, then a read to confirm the text left the box. The text itself is never re-typed."""
+    """Enter, then a read to confirm the text left the box. The text itself is never re-typed.
+    A read that FAILS after Enter confirms nothing (15 Sep; until then it marked the reply delivered
+    and confirmed): the entry stays "typed", unconfirmed, and the next try reads the window before
+    anything is pressed, so Enter goes again only if the exact text still sits alone in the box."""
     rc, out, err = _cmux("send-key", ws, "--", "enter", surface=surface)
     if rc != 0:
         entry["state"] = "typed"
         entry["reason"] = "the text is typed in the window; pressing Enter failed, trying again"
         return
-    entry["state"] = "delivered"
-    entry["delivered_at"] = time.time()
-    entry["reason"] = "delivered"
+    entry["entered_at"] = time.time()
     _SLEEP(0.5)
     try:
         box = _box_text(_read_screen(ws, surface), long=True)
-    except OSError:
-        box = None
+    except OSError as ex:
+        entry.update(state="typed", confirmed=False, unconfirmed=True,
+                     reason=f"Enter was pressed but the window could not be read afterwards ({ex}), so delivery "
+                            "is not confirmed; the window is read again before anything else is pressed")
+        return
+    entry["state"] = "delivered"
+    entry["delivered_at"] = time.time()
+    entry["reason"] = "delivered"
+    entry.pop("unconfirmed", None)
     head = re.sub(r"\s+", "", entry["text"])[:30]
     if box and head and box.startswith(head):
         entry["state"] = "typed"
@@ -959,6 +1023,9 @@ def _attempt(entry):
     """One try, under the outbox lock. Mutates entry."""
     entry["attempts"] = entry.get("attempts", 0) + 1
     entry["last_try"] = time.time()
+    if "\n" in (entry.get("text") or "") and entry.get("state") in ("waiting", None):
+        entry.update(state="failed", reason=MULTILINE_REASON)   # never typed (see flatten)
+        return
     ws, surface = _where(entry)
     if not ws:
         entry["reason"] = f"no open window for the {entry.get('label') or entry.get('lane') or 'agent'}"
@@ -1021,7 +1088,7 @@ def _save_now(entry):
 
 
 def _submit(text, items, ledger, workspace, surface, session_id, lane, label, kind):
-    wire = flatten(text)
+    wire = flatten(text).strip("\n")
     if not wire.strip():
         return _refused("the message is empty")
     if test_mode() and not test_workspace():
@@ -1035,16 +1102,23 @@ def _submit(text, items, ledger, workspace, surface, session_id, lane, label, ki
             ledger_path()                             # refuses test mode without a test ledger
     except Refused as ex:
         return _refused(str(ex))
-    ledger_error = ""
     if ledger:
         try:
             ledger_append(ledger)
-        except (OSError, Refused) as ex:
-            ledger_error = f"his words could not be written to the ANSWERS ledger ({ex})"
+        except Exception as ex:                       # 15 Sep: no ledger row, no delivery
+            err = f"his words could not be written to the ANSWERS ledger ({type(ex).__name__}: {ex})"
+            return dict(_refused(err + ", so nothing was sent; his text is still his to send again"),
+                        ledger_error=err)
     entry = {"id": uuid.uuid4().hex[:12], "kind": kind, "created": time.time(), "text": wire,
              "items": list(items or []), "workspace": workspace, "surface": surface,
              "session_id": session_id, "lane": lane, "label": label, "state": "waiting",
              "reason": "", "attempts": 0, "last_try": 0, "confirmed": False}
+    if "\n" in wire:                                  # 15 Sep: kept and shown, never typed (see flatten)
+        entry.update(state="failed", reason=MULTILINE_REASON, held_for="line breaks")
+        with _OutboxLock():
+            _put(entry)
+        return _result(entry)
+    ledger_error = ""
     try:
         with _OutboxLock():
             _put(entry)
@@ -1158,8 +1232,9 @@ def about(item, n=ABOUT_CHARS):
 
 
 def compose_reply(items_notes, words):
-    """items_notes: [(item, note)]. One line, the SPEC's prefix."""
-    w = flatten(words)
+    """items_notes: [(item, note)]. The SPEC's prefix; his words as written (a line break in them
+    holds the message, see flatten)."""
+    w = flatten(words).strip()
     if len(items_notes) == 1:
         it, note = items_notes[0]
         extra = f" ({note})" if note else ""
@@ -1224,7 +1299,7 @@ def message_coordinator(text):
     tgt = _target(COORDINATOR)
     rows = [("Said from the Agents app",
              f"his words, typed in the Agents app message bar {_stamp()}, to the coordinator (WORKFLOW)", words)]
-    return deliver(tgt["workspace"], "[From the Agents app] " + flatten(words), items=None, ledger=rows,
+    return deliver(tgt["workspace"], "[From the Agents app] " + flatten(words).strip(), items=None, ledger=rows,
                    surface_id=tgt["surface"], session_id=tgt["session_id"], lane=COORDINATOR,
                    label=tgt["label"], kind="coordinator")
 
@@ -1827,6 +1902,8 @@ def selftest():
             if state["deny"]:
                 return 1, "", deny_err
             cmd = argv[1]
+            if cmd == "read-screen" and state.get("read_fails_after_enter") and state["typed"][-1:] == ["<ENTER>"]:
+                return 1, "", "read-screen failed (planted)"
             if cmd == "read-screen":
                 scr = screens[state["screen"]]
                 if state["screen"] == "idle":
@@ -1874,7 +1951,8 @@ def selftest():
         print("wire")
         _check(results, "backslash chunks end at every backslash",
                wire_chunks("a\\nb\\") == ["a\\", "nb\\"] and "".join(wire_chunks("x\\ty")) == "x\\ty")
-        _check(results, "newlines flatten to one line", flatten("one\ntwo\r\n\nthree\tx") == "one / two / three x")
+        _check(results, "line breaks are kept on the wire, never joined with ' / ' (15 Sep); tabs become spaces",
+               flatten("one\ntwo\r\n\nthree\tx y") == "one\ntwo\n\nthree x\ny", repr(flatten("one\ntwo\r\n\nthree\tx y")))
         print("gate")
         n0 = len(calls)
         r = deliver(REAL_WS, "hello", ledger=[("s", "h", "w")])
@@ -1951,7 +2029,7 @@ def selftest():
         items = [{"id": "aaaa000001", "lane": "clip", "text": "Clip question one " + "x" * 200},
                  {"id": "aaaa000002", "lane": "stack", "text": "[row 9] stack row"},
                  {"id": "aaaa000003", "lane": "clip", "text": "Clip question two"}]
-        res = reply(items, "yes, do it\nand tell me")
+        res = reply(items, "yes, do it and tell me")
         msgs = [t for t in state["typed"] if t != "<ENTER>"]
         _check(results, "two agents, two messages", len(res) == 2 and len(msgs) == 2 and all(x["state"] == "delivered" for x in res),
                str([(x["lane"], x["items"]) for x in res]))
@@ -1960,7 +2038,7 @@ def selftest():
         clipmsg = [m for m in msgs if "2 items" in m]
         _check(results, "one agent's items numbered in one message, each cut at 120",
                bool(clipmsg) and "1. Clip question one " in clipmsg[0] and " 2. Clip question two" in clipmsg[0]
-               and ("x" * 102 + ELLIPSIS) in clipmsg[0] and "yes, do it / and tell me" in clipmsg[0], clipmsg[0][:80] if clipmsg else "")
+               and ("x" * 102 + ELLIPSIS) in clipmsg[0] and "] yes, do it and tell me Before" in clipmsg[0], clipmsg[0][:80] if clipmsg else "")
         one = [m for m in msgs if m.startswith("[From the Agents app, about: [row 9]")]
         _check(results, "single item uses the SPEC prefix",
                bool(one) and one[0].endswith("Before acting, check whether this is already resolved; if it is, say so in one line."))
@@ -2206,6 +2284,137 @@ def selftest():
                f"probe path: {a['calls_to_first']} cmux call, then {a['pump_calls']} in 3 pump passes, {a['rename_calls']} for a "
                f"rename; first-reply path: {b['calls_to_first']} then {b['pump_calls']}; sabotaged: {sab13['pump_calls']} "
                f"cmux calls in 3 passes, reason {sab13['reason'][:40]!r}")
+        _save_outbox([])
+
+        print("REDESIGN-PLAN Phase 0, 15 Sep: reply bugs")
+        # P3. A read that fails after Enter confirms nothing.
+        state["typed"].clear()
+        state.update(screen="idle", box="", after=None, read_fails_after_enter=True)
+        text3 = "enter pressed, then the window went unreadable"
+        r3 = deliver(TEST_WS, text3)
+        ent3 = next((e for e in _load_outbox() if e.get("id") == r3["outbox_id"]), {})
+        first3 = (r3["state"], r3["confirmed"], ent3.get("state"), list(state["typed"]))
+        state["read_fails_after_enter"] = False
+        _save_outbox([dict(e, last_try=0) for e in _load_outbox()])
+        pump()
+        ent3b = next((e for e in _load_outbox() if e.get("id") == r3["outbox_id"]), {})
+        ok3 = (first3[:3] == ("held", False, "typed") and first3[3] == [text3, "<ENTER>"]
+               and ent3b.get("state") == "delivered" and ent3b.get("confirmed") is False and state["typed"] == [text3, "<ENTER>"])
+        _check(results, "a read that fails after Enter: not delivered, not confirmed; the next try reads the window, finds "
+                        "the box empty and marks it delivered unconfirmed, typing and pressing nothing again",
+               ok3, f"first {first3[:3]}, then {ent3b.get('state')} confirmed={ent3b.get('confirmed')}, keys {state['typed']}")
+        _save_outbox([])
+
+        # P4. A multi-line reply is never squashed to " / ": kept with the reason, his words verbatim in the ledger.
+        def multiline_cases():
+            _save_outbox([])
+            state["typed"].clear()
+            state.update(screen="idle", box="", after=None)
+            rr = reply([{"id": "ml000001", "lane": "clip", "text": "a clip question"}], "first line\nsecond line")
+            rc = message_coordinator("line one\r\nline two")
+            rt = deliver(TEST_WS, "one line with a trailing break\n")
+            held = [e["state"] for e in _load_outbox() if e.get("held_for") == "line breaks"]
+            return rr[0], rc, rt, list(state["typed"]), held
+        rr4, rc4, rt4, typed4, held4 = multiline_cases()
+        led4 = open(os.environ["AGENTS_TEST_LEDGER"]).read()
+        ok4 = (rr4["state"] == "failed" and rr4["reason"] == MULTILINE_REASON and rc4["state"] == "failed"
+               and "first line<br>second line" in led4 and "line one<br>line two" in led4 and held4 == ["failed", "failed"]
+               and rt4["state"] == "delivered" and typed4 == ["one line with a trailing break", "<ENTER>"])
+        real_flatten = globals()["flatten"]
+        globals()["flatten"] = lambda t: " / ".join(p.strip() for p in (t or "").replace("\r\n", "\n").split("\n") if p.strip())
+        try:
+            sab4 = multiline_cases()                       # sabotage: the old " / " rule
+        finally:
+            globals()["flatten"] = real_flatten
+        caught4 = any(" / " in t for t in sab4[3] if isinstance(t, str))
+        _check(results, "a reply with line breaks is never squashed to ' / ': kept as failed with the reason, nothing "
+                        "typed, his words in the ledger with their breaks; one trailing break still sends; sabotage "
+                        "(the old ' / ' rule) makes it fail",
+               ok4 and caught4, f"reply {rr4['state']}, message bar {rc4['state']}, held {held4}, typed {typed4}; "
+                                f"sabotaged typed {[t[:40] for t in sab4[3] if ' / ' in t]}")
+        _save_outbox([])
+
+        # P5. The ANSWERS ledger cannot be written: nothing is delivered.
+        state["typed"].clear()
+        state.update(screen="idle", box="", after=None)
+        real_ledger_append = globals()["ledger_append"]
+
+        def broken_ledger(rows, now=None):
+            raise OSError(28, "No space left on device (planted)")
+        globals()["ledger_append"] = broken_ledger
+        n5 = len(calls)
+        try:
+            r5 = deliver(TEST_WS, "words that must not go without their ledger row", items=["lf1"], ledger=[("s", "h", "w")])
+            rq5 = reply([{"id": "lf000002", "lane": "clip", "text": "q"}], "a reply that must not go")
+        finally:
+            globals()["ledger_append"] = real_ledger_append
+        ok5 = (r5["state"] == "refused" and "ANSWERS ledger" in r5["ledger_error"] and "No space left" in r5["ledger_error"]
+               and rq5[0]["state"] == "refused" and bool(rq5[0]["ledger_error"]) and len(calls) == n5
+               and state["typed"] == [] and _load_outbox() == [])
+        _check(results, "the ANSWERS ledger cannot be written: nothing typed, no cmux call, no outbox entry, and the result "
+                        "carries the ledger error", ok5,
+               f"{r5['state']}: {r5['ledger_error'][:70]} | reply {rq5[0]['state']} | cmux calls {len(calls) - n5}")
+
+        # P6. The check after typing tells "ab" from "a b"; wrapping still matches.
+        idle6 = screens["idle"]
+        words6 = ("word " * 60).strip()
+
+        def typed_cases():
+            return {
+                "ab in the box, typed a b": check_typed(with_box(idle6, "ab"), "a b")[0],
+                "a b in the box, typed a b": check_typed(with_box(idle6, "a b"), "a b")[0],
+                "two spaces in the box, typed one": check_typed(with_box(idle6, "a  b"), "a b")[0],
+                "wrapped at spaces": check_typed(with_box(idle6, words6, width=25), words6)[0],
+                "wrapped inside a word": check_typed(with_box(idle6, "abcdefghij" * 5, width=17), "abcdefghij" * 5)[0],
+                "wrapped, a space missing inside a line": check_typed(
+                    with_box(idle6, words6.replace("word word", "wordword", 1), width=25), words6)[0],
+            }
+        want6 = {"ab in the box, typed a b": False, "a b in the box, typed a b": True,
+                 "two spaces in the box, typed one": False, "wrapped at spaces": True, "wrapped inside a word": True,
+                 "wrapped, a space missing inside a line": False}
+        got6 = typed_cases()
+        real_holds = globals()["_box_holds"]
+        globals()["_box_holds"] = lambda first, rest, typed: bool(re.sub(r"\s+", "", typed or "")) and \
+            re.sub(r"\s+", "", first + "".join(rest)) == re.sub(r"\s+", "", typed or "")
+        try:
+            sab6 = typed_cases()                           # sabotage: the old rule, every space removed
+        finally:
+            globals()["_box_holds"] = real_holds
+        _check(results, "the check after typing tells 'ab' from 'a b' and still matches text wrapped at a space or inside "
+                        "a word; sabotage (every space removed, the old rule) makes it fail",
+               got6 == want6 and sab6 != want6,
+               f"wrong: {[k for k in want6 if got6[k] != want6[k]]}; sabotaged wrong: {[k for k in want6 if sab6[k] != want6[k]]}")
+
+        # P7. The outbox's own read and write wait for the cross-process lock, and nesting never waits on itself.
+        _save_outbox([])
+        opath = _outbox_path()
+        holder = open(opath + ".lock", "a")
+        fcntl.flock(holder, fcntl.LOCK_EX)                 # as another process holding the outbox
+        done7 = {}
+
+        def writer7():
+            _save_outbox([{"id": "lock-probe", "state": "cancelled"}])
+            done7["wrote"] = True
+        t7 = threading.Thread(target=writer7, daemon=True)
+        t7.start()
+        time.sleep(0.4)
+        during7 = "lock-probe" in open(opath).read()
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        holder.close()
+        t7.join(5)
+        after7 = "lock-probe" in open(opath).read()
+
+        def nested7():
+            with _OutboxLock():
+                _put({"id": "nested-probe", "state": "cancelled"})
+            done7["nested"] = True
+        t7b = threading.Thread(target=nested7, daemon=True)
+        t7b.start()
+        t7b.join(5)
+        ok7 = not during7 and after7 and done7.get("wrote") and done7.get("nested") and not t7b.is_alive()
+        _check(results, "the outbox write waits while another process holds the outbox lock, then lands; the lock taken "
+                        "around a load and save does not wait on itself",
+               ok7, f"written while held {during7}, after release {after7}, nested finished {bool(done7.get('nested'))}")
         _save_outbox([])
 
         print("no em dashes")

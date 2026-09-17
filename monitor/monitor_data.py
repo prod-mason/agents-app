@@ -7,7 +7,10 @@ max), amount of time spent on task total, # of tasks currently running, # of tas
 that are waiting on me. Yellow if it requires more than me just reading and making a decision."
 
 READ-ONLY toward everything of Mason's and the lab's. The only files this module writes are its own
-cache files in ~/Library/Caches/com.masondean.agents/, each by atomic replace: state-v<engine>.json
+cache files in ~/Library/Caches/com.masondean.agents/ (and a "<name>.lock" beside each, held with
+fcntl.flock while it is written, so two agents running this at once cannot lose each other's work;
+a lock another process holds for more than LOCK_WAIT_S leaves the file unwritten rather than
+hanging the CLI), each by atomic replace: state-v<engine>.json
 (the transcript cache, named by engine version so an older engine still running in his open app
 never trades entries with this one), waits.json (first_seen per waiting item, earliest wins) and
 storage.json (free-space samples and scratch sizes at first sight). queue.py is loaded and
@@ -47,13 +50,26 @@ For the app:
         lane                the roster lane of the session, or None
         decisions_waiting, total_wait_seconds, waits_as_of   from w, or else the last good
                             waiting() result of this process when under 180 s old; None, shown
-                            "?", when there is none, the last waiting() failed, or the row has no
-                            session id
+                            "?", when there is none, the last waiting() failed, the row has no
+                            session id, or (15 Sep, second pass) the session is in no roster.json
+                            row while some item on the list has no live owner: any of those could
+                            be this conversation's, so 0 would be a false number. Only with every
+                            item owned by a live session elsewhere does such a row read 0, and
+                            either way waiting_note says why and the CLI prints it under the row
+        in_roster           the session has a row in roster.json; False means no waiting item can
+                            reach this row at all, whatever the lane is working on
+        typed_waiting       the numbers this conversation's own words state ([{where, said, words}])
+        waiting_mismatch    one of those numbers disagrees with decisions_waiting
+        waiting_note        one plain line saying so, and saying when the session is in no roster row
     waiting(now=None) also returns: enriched, as_of, unowned, unowned_wait_seconds,
         may_be_settled_count, stale_total, and enrich_note only when the extra numbers failed.
         unjustified: queue.py's WAITING ON lines that give no "because" (fence 50), NOT counted in
         total or counts: [{"key", "lane", "field", "text"}], key a stable 10-character id made here
         (queue.py gives these lines none); unjustified_total. SPEC section 11, "asks without a reason".
+        lanes: per owner lane (see lane_report), the count COMPUTED from these items beside whatever
+        number the lane itself typed, mismatch when they differ, the items that reached the list from
+        a field other than decisions_for_mason, and the asks written outside it; hidden_asks_total and
+        mismatch_lanes summarise it, and lanes_note says so when it could not be worked out.
         Each item also carries: world, world_note, owner_lane, owner_session, first_seen,
         waiting_since, waited_seconds, wait_at_least, since_from, since_precision, record_date,
         may_be_settled, settled_reason, settled_reasons.
@@ -167,7 +183,8 @@ off-machine "away from the Mac". Em dashes in item text become commas (there wer
 
 Headline and summary (SPEC sections 1 and 11). Measured by richtext.py on the message's Markdown
 after em dashes become commas; nothing is ever cut. HEADLINE: richtext.opening_line (the first
-line that shows any text); ok when it is at most 50 visible characters and not code. It needs no
+line that shows any text); ok when it is at most 50 characters A READER COUNTS (richtext.visible_len,
+grapheme clusters since 15 Sep, so a family emoji costs 1 of the 50 and not 7) and not code. It needs no
 end punctuation (SPEC section 11, 11 Sep: "a news headline has no end punctuation"), so "Waiting
 on you: approve the install" is a valid headline; "complete" still reports whether it ends a
 statement, but it does not decide "ok" and the CLI never tags a headline "not a finished
@@ -203,6 +220,25 @@ is the row's session, every bucket; total_wait_seconds sums their waited_seconds
 Items with no live owner are counted in waiting()'s "unowned", so the rows plus unowned add up to
 the manifest total.
 
+Counts computed, never typed (REDESIGN-PLAN Phase 0 item 1). Every count above is counted from the
+items the list itself shows. A number a lane WROTE ("Three questions sit on him", "Waiting on you: 5
+Leveller decisions", "the eight entries in decisions_for_mason") is never used as a count: typed_counts
+reads those numbers and they are only ever compared with the computed one, so a stale number shows as
+a mismatch on the lane and on the row instead of being believed. lane_report also counts each lane's
+items whatever the state of roster.json, because a row can only be matched to items through the roster:
+when a lane's roster session is not the one running, its items reach no row, the lane line names the
+session the roster believes in, and the row says its session is in no roster row.
+
+Asks written outside decisions_for_mason (Phase 0 item 2). hidden_asks walks every string in a lane's
+status file except decisions_for_mason and the fields a lane keeps settled things in, and reports each
+line whose own words say it waits on him (or whose field is named for that, such as
+resume.still_waiting_on_his_words). Each is marked: on_list when queue.py reads that field so he does
+see it, points_at_list when it only names the list ("4 six-part decisions in decisions_for_mason"),
+repeats_decision when it says again what an entry asks, paused when the lane is one he has paused.
+None of them is ever added to the list or to any count; the CLI prints the rest in their own section.
+Left out by queue.py's own rules: history openings (CLOSED, ANSWERED, DONE, PARKED), a line the lane
+says belongs to another lane or board, and anything under a settled field.
+
 Waiting time per item (SPEC section 2). first_seen: the first time this engine saw the item id,
 kept in waits.json (earliest wins across processes; forgotten after 30 days unseen). Backfill from
 a date in the item's OWN record, never from dates its text merely mentions (most are history):
@@ -225,9 +261,19 @@ ahead of now is not a start. Otherwise first_seen, and wait_at_least True ("at l
 
 May be settled (SPEC sections 2 and 11, the free checks). An item is tagged when any of these three
 STRONG checks holds; each reason names both sides of its comparison:
-  - an ANSWERS-*.md ledger in lab-common (and AGENTS_TEST_LEDGER when set) holds the item id, or
-    the first 60 characters of its text (or of its "question" field), compared ignoring case,
-    backslashes, asterisks, backticks and runs of white space; at least 20 characters are needed;
+  - an ANSWERS-*.md ledger in lab-common (and AGENTS_TEST_LEDGER when set) holds the item id, or its
+    own words: the first 60 characters of its text (or of its "question" field) with the lane's
+    boilerplate opening dropped ("WAITING ON MASON: ", "Question: ", "3. "), cut at a word boundary
+    and found in the ledger as whole words, compared ignoring case, backslashes, asterisks, backticks
+    and runs of white space. At least 40 characters are needed, and the opening is dropped, because
+    the key is only a PREFIX: 20 characters of common words appear in a ledger about something else,
+    and two items that open with the same sentence about different plugins shared their first 60
+    characters, so one answer settled both (15 Sep). A SHORTER ask (under 40 characters once the
+    opening is dropped) is keyed by its WHOLE text instead, and that must stand alone in the ledger,
+    as its own cell, after a label's colon or quoted, never as words inside a longer sentence (the
+    second pass, 15 Sep: before it such asks had no text key, so an answer recorded by hand never
+    settled them and the tag was lost without a word). Under 12 characters an ask has no text key at
+    all, so his one-word answers ("go") can never match one;
   - its world is STALE (a file it names is gone). queue.py keeps STALE items out of its items
     list, so today this fires only if queue.py starts passing them through;
   - its OWN CROSS-LANE row is closed: a row named in the item's leading bracket tag, like
@@ -268,7 +314,9 @@ retried once from zero; if that fails too, the row's note says so.
 """
 
 import calendar
+import contextlib
 import datetime
+import fcntl
 import glob
 import hashlib
 import importlib.util
@@ -884,6 +932,45 @@ def scan_file(path, entry):
 # Cache persistence (shared by the app and the CLI)
 # ---------------------------------------------------------------------------------------------
 
+LOCK_WAIT_S = 3.0        # how long a cache write waits for another process before leaving the file alone
+
+
+@contextlib.contextmanager
+def _file_lock(path):
+    """An exclusive lock for one cache file, held on "<path>.lock" beside it (the file itself is always
+    replaced by rename, so its own inode cannot be the lock). Yields True when the lock was taken and
+    False when another process held it for LOCK_WAIT_S; a caller that did not get it leaves the file
+    untouched rather than writing back a merge of what it read before that other process wrote.
+    Never waits long, because every agent runs this module as a CLI (15 Sep: until today two processes
+    could read, merge and replace the same cache at once and one of the two changes was lost)."""
+    fh = None
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        fh = open(path + ".lock", "a")
+    except OSError:
+        yield False
+        return
+    got = False
+    try:
+        deadline = time.time() + LOCK_WAIT_S
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                got = True
+                break
+            except OSError:
+                if time.time() >= deadline:
+                    break
+                time.sleep(0.02)
+        yield got
+    finally:
+        try:
+            if got:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+        finally:
+            fh.close()
+
+
 _MEM = {"state": None, "disk_mtime": None}
 
 
@@ -935,14 +1022,17 @@ def _save_cache():
         return
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
-        _merge(state, _read_disk_state())
-        for path in [p for p in state["files"] if not os.path.exists(p)]:
-            del state["files"][path]
-        tmp = f"{STATE_PATH}.{os.getpid()}.tmp"
-        with open(tmp, "w") as fh:
-            json.dump(state, fh, separators=(",", ":"))
-        os.replace(tmp, STATE_PATH)
-        _MEM["disk_mtime"] = os.stat(STATE_PATH).st_mtime
+        with _file_lock(STATE_PATH) as got:
+            if not got:
+                return                                # another process is writing it; ours waits for next time
+            _merge(state, _read_disk_state())
+            for path in [p for p in state["files"] if not os.path.exists(p)]:
+                del state["files"][path]
+            tmp = f"{STATE_PATH}.{os.getpid()}.tmp"
+            with open(tmp, "w") as fh:
+                json.dump(state, fh, separators=(",", ":"))
+            os.replace(tmp, STATE_PATH)
+            _MEM["disk_mtime"] = os.stat(STATE_PATH).st_mtime
     except OSError:
         pass                                          # a cache that cannot be saved costs time, not truth
 
@@ -1046,7 +1136,8 @@ def roster_headline(session_id):
 _ROW_NEW = {"headline": None, "summary": None, "waiting_on_you": False, "full_text": "",
             "full_text_ts": None, "full_text_cut": False, "text_source": "", "working": None,
             "ticking": None, "registry_status": None, "last_entry_ts": None, "lane": None,
-            "decisions_waiting": None, "total_wait_seconds": None, "waits_as_of": None}
+            "decisions_waiting": None, "total_wait_seconds": None, "waits_as_of": None,
+            "in_roster": None, "typed_waiting": [], "waiting_mismatch": False, "waiting_note": ""}
 
 
 def _row(title, tty, pid):
@@ -1105,7 +1196,9 @@ def _fill(row, pid, proc_start, notes, cache):
     rs = reg.get("status")
     row["registry_status"] = rs if isinstance(rs, str) else None
     try:
-        row["lane"] = (_roster_sessions().get(sid) or {}).get("lane")
+        roster = _roster_sessions()
+        row["lane"] = (roster.get(sid) or {}).get("lane")
+        row["in_roster"] = sid in roster              # false: no waiting item can be matched to this row
     except (OSError, ValueError):
         pass
     started = reg.get("startedAt")
@@ -1390,7 +1483,8 @@ def waiting_from_manifest(m):
     return {"ok": True, "message": "", "total": m.get("total"), "counts": m.get("counts"),
             "sha": m.get("sha"), "items": items, "enriched": False,
             "stale_total": len(stale) if isinstance(stale, list) else None,
-            "unjustified": unjust, "unjustified_total": len(unjust)}
+            "unjustified": unjust, "unjustified_total": len(unjust),
+            "lanes": {}, "hidden_asks_total": None, "mismatch_lanes": []}
 
 
 def unjustified_from_manifest(m):
@@ -1433,6 +1527,13 @@ def _waiting(now):
         enrich(w, now)
     except Exception as ex:                           # the list still shows; its extra numbers say why not
         w["enrich_note"] = f"waiting times and checks could not be worked out ({type(ex).__name__}: {ex})"
+    try:
+        w["lanes"] = lane_report(w)
+        w["hidden_asks_total"] = sum(v["hidden_total"] for v in w["lanes"].values())
+        w["mismatch_lanes"] = sorted(k for k, v in w["lanes"].items() if v["mismatch"])
+    except Exception as ex:                           # the counts still stand; the lane notes say why not
+        w.update(lanes={}, hidden_asks_total=None, mismatch_lanes=[],
+                 lanes_note=f"the lanes could not be read ({type(ex).__name__}: {ex})")
     _LAST_WAITING.update(w=w, t=time.time())
     return w
 
@@ -1610,7 +1711,12 @@ def owner_session(lane, roster, live):
 
 def attach_waits(rows, w):
     """decisions_waiting and total_wait_seconds per row, from one waiting() result, never recounted.
-    None ("?") when that result is missing or failed, or the row has no session id."""
+    None ("?") when that result is missing or failed, or the row has no session id. Each row also
+    carries the numbers ITS OWN message typed (typed_waiting), whether any of them disagrees with the
+    count computed from the list (waiting_mismatch), and one plain line saying so (waiting_note).
+    A row whose session is in no roster.json row can be matched to no item, so its 0 is not a count
+    (row_count): it reads None, "?", whenever some item on the list has no live owner. On 15 Sep the
+    CLI printed a bare 0 on 14 of 16 rows this way while 47 of 50 items reached no row."""
     if not w or not w.get("ok") or not w.get("enriched"):
         return rows
     by = {}
@@ -1619,11 +1725,344 @@ def attach_waits(rows, w):
         if sid:
             n, s = by.get(sid, (0, 0))
             by[sid] = (n + 1, s + int(it.get("waited_seconds") or 0))
+    unowned = sum(1 for it in w["items"] if not it.get("owner_session"))
+    lanes = w.get("lanes") or {}
     for r in rows:
         if r.get("session_id"):
-            n, s = by.get(r["session_id"], (0, 0))
+            n, s = row_count(r, by, unowned)
             r.update(decisions_waiting=n, total_wait_seconds=s, waits_as_of=w.get("as_of"))
+            _typed_into_row(r, n, lanes, unowned)
     return rows
+
+
+def row_count(row, by, unowned):
+    """(count, seconds) for one row: the items whose owner session is the row's. A session in no
+    roster.json row owns nothing by construction, so its 0 is no count: None when any item on the
+    list has no live owner (it could be this conversation's), 0 only when every item is owned by a
+    live session elsewhere, which is the same rule the window applies to an unmatched row."""
+    n, s = by.get(row["session_id"], (0, 0))
+    if row.get("in_roster") is False and unowned:
+        return None, None
+    return n, s
+
+
+def _typed_into_row(row, counted, lanes, unowned=0):
+    """The numbers the row's own words state, against the count computed from the list. A lane writing
+    "Waiting on you: 5 Leveller decisions" while the list holds 4 of its items is the failure Phase 0
+    item 1 names: the typed number is never believed, and where the two differ the row says both.
+    With no count (None), nothing is judged: the note says why there is none and what the words say."""
+    said = []
+    for where, f in (("its headline", row.get("headline")), ("its summary", row.get("summary"))):
+        for n, words in typed_counts((f or {}).get("visible") or ""):
+            said.append({"where": where, "said": n, "words": words})
+    lane = row.get("lane")
+    if lane and isinstance(lanes.get(lane), dict):
+        said += [dict(t) for t in (lanes[lane].get("typed") or [])]
+    row["typed_waiting"] = said
+    row["waiting_mismatch"] = counted is not None and any(t["said"] != counted for t in said)
+    notes = []
+    if row["waiting_mismatch"]:
+        notes.append(f"{counted} on the list, but " + ", ".join(
+            f'{t["where"]} says {t["said"]}' for t in said if t["said"] != counted))
+    if row.get("in_roster") is False:
+        line = "its session is in no roster.json row, so no item of the list can reach this row"
+        if counted is None:
+            line += (f", and {unowned} item{'' if unowned == 1 else 's'} on the list "
+                     f"{'has' if unowned == 1 else 'have'} no live owner, so its count is not known")
+            if said:
+                line += "; its own words say " + ", ".join(f'{t["said"]} ({t["where"]})' for t in said)
+        else:
+            line += "; every item on the list is owned by a live session elsewhere, so 0 is its count"
+        notes.append(line)
+    row["waiting_note"] = "; ".join(notes)
+
+
+# ---------------------------------------------------------------------------------------------
+# What each lane's own words claim, and the asks written outside decisions_for_mason
+# (REDESIGN-PLAN Phase 0 items 1 and 2)
+# ---------------------------------------------------------------------------------------------
+
+PAUSED_LANES_FILE = os.path.join(LAB, "paused_lanes.json")
+_NUM_WORDS = {"no": 0, "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+              "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+              "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+              "nineteen": 19, "twenty": 20}
+_NUM = r"(?:\d{1,3}|" + "|".join(sorted(_NUM_WORDS, key=len, reverse=True)) + r")"
+_COUNT_NOUN = r"(?:questions?|decisions?|asks?|items?|entries|things)"
+_TYPED_ON_HIM = re.compile(r"\b(?P<n>" + _NUM + r")\s+(?:\S+\s+){0,3}?" + _COUNT_NOUN +
+                           r"\b[^.;]{0,40}?\b(?:on (?:his|him|you|your|mason)|for (?:him|you|mason)|"
+                           r"sits? on (?:him|you)|sitting on (?:him|you)|waits? on (?:him|you|mason)|"
+                           r"waiting on (?:him|you|mason))\b", re.I)
+_TYPED_AFTER_WAITING = re.compile(r"\b(?:waiting|waits)\s+on\s+(?:you|him|mason)\b[^\w\n]{0,3}\s*(?:is\s+)?"
+                                  r"(?P<n>" + _NUM + r")\s+(?:\S+\s+){0,3}?" + _COUNT_NOUN + r"\b", re.I)
+_TYPED_BOARD = re.compile(r"\b(?P<n>" + _NUM + r")\s+(?:\S+\s+){0,2}?" + _COUNT_NOUN +
+                          r"\s+(?:in|on)\s+(?:decisions_for_mason|his board|the board)\b", re.I)
+
+
+def typed_counts(text, explicit_only=False):
+    """[(number, the words that said it)] for every place this TEXT states how many things wait on him:
+    "Three questions sit on him", "Waiting on him: 4 six-part decisions", "the eight entries in
+    decisions_for_mason". Pure: it reads this string and nothing else. Such a number is never used as
+    a count (the items are, see lane_counts); it is compared with the computed count so a lane's stale
+    number shows as a mismatch instead of being believed. explicit_only keeps just the "N entries in
+    decisions_for_mason" form, for fields where a number in prose usually describes ONE ask, as in the
+    EQ lane's "One decision for him: whether EQs follow"."""
+    out, spans = [], []
+    if _HISTORY_OPEN.match(text or ""):
+        return out                       # "CLOSED 11 Sep ... the one item that was waiting on him" is history
+    for pat in ((_TYPED_BOARD,) if explicit_only else (_TYPED_ON_HIM, _TYPED_AFTER_WAITING, _TYPED_BOARD)):
+        for m in pat.finditer(text or ""):
+            if re.search(r"\b(?:was|were|had been|used to)\b", m.group(0), re.I):
+                continue                 # a number that WAS waiting is not a number that waits
+            tok = m.group("n").lower()
+            if tok in _NUM_WORDS:
+                n = _NUM_WORDS[tok]
+            else:
+                try:
+                    n = int(tok)
+                except ValueError:
+                    continue
+            a, b = m.span()
+            # One sentence read by two patterns ("Waiting on him: 4 six-part decisions in
+            # decisions_for_mason") states one number, not two.
+            if any(n == kn and a < kb and ka < b for kn, ka, kb in spans):
+                continue
+            spans.append((n, a, b))
+            out.append((n, no_em_dash(re.sub(r"\s+", " ", m.group(0)).strip())))
+    return out
+
+
+_ASK_MARKER = re.compile(r"waiting on (?:mason|him|you)\b|waits on (?:mason|him|you)\b|"
+                         r"needs? (?:mason|him) to\b|needs his (?:go|call|word|answer|hands|ear|decision|permission)\b",
+                         re.I)
+_ASK_FIELD = re.compile(r"waiting_on_(?:his|him|mason|you)|^for_mason$|^for_him$|needs_(?:mason|him)", re.I)
+_HISTORY_OPEN = re.compile(r"^\s*(?:\[[^\]]{0,80}\]\s*)?(?:CLOSED|ANSWERED|RESOLVED|DONE|DECLINED|WITHDRAWN|"
+                           r"SUPERSEDED|OFF HIS LIST|PARKED|QUIET MODE|NO LONGER NEEDED)\b", re.I)
+# queue.py's own rules, so this scan calls nothing an ask that queue.py has already ruled out.
+_CLOSED_KEY = re.compile(r"(?<!un)resolved|(?<!un)decided|(?<!un)closed|(?<!un)answered|(?:^|_)done(?:_|$)|"
+                         r"moved_to|corrections", re.I)
+_NOT_HIS_LINE = (re.compile(r"^[^.?!:]{3,160}:\s*ANSWERED\b"),
+                 re.compile(r"\brouted to the (?!this\b)[A-Za-z][\w'-]*(?:\s+[A-Za-z][\w'-]*)?\s+lane\b"),
+                 re.compile(r"\bon the [A-Za-z][\w-]*(?:'s)? board\b"))
+ASK_MIN_CHARS = 25       # a marker with no sentence around it does not say what he is being asked
+ASK_CLAUSE_MAX = 240     # what is reported is the sentence the marker sits in, not a whole resume
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+# A line that names the list itself is POINTING at it ("Waiting on him: 4 six-part decisions in
+# decisions_for_mason", "HIS BOARD: the eight entries in decisions_for_mason"), which is what a resume
+# and a headline are for. It is not a second, hidden ask.
+_POINTS_AT_LIST = re.compile(r"decisions_for_mason|\bhis board\b|\bon the board\b|\bthe stack\b|stack\.md", re.I)
+_ASK_STOP = {"the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "is", "are", "it", "that",
+             "this", "his", "he", "you", "him", "mason", "with", "be", "as", "at", "by", "not", "no",
+             "yes", "from", "because", "so", "now", "waiting", "waits", "needs", "need", "only", "can"}
+
+
+def _closed_key(key):
+    k = (key or "").lower()
+    if k.split(".")[0] == "answered_not_acted":
+        return False     # his answer waiting on US, and a "blocked_on: needs Mason to run it" is a new ask
+    if _ASK_FIELD.search(k):
+        return False     # "still_waiting_on_his_words" is an ask however else the field reads
+    if k == "his_words":
+        return True      # inside answered_not_acted: what HE said, never an ask of his
+    return bool(_CLOSED_KEY.search(k))
+
+
+def paused_lanes():
+    """The lanes he has paused (lab-common/paused_lanes.json, queue.py's own file). A paused lane's
+    words are not asks of him: he told it to stop, and counting them would inflate his queue with work
+    he has already decided not to do."""
+    try:
+        with open(PAUSED_LANES_FILE) as fh:
+            d = json.load(fh)
+        p = d.get("paused") if isinstance(d, dict) else None
+        return set(p) if isinstance(p, dict) else set()
+    except (OSError, ValueError):
+        return set()
+
+
+def read_status(status_dir=None):
+    """[(lane, data or None, problem)] for every lab-common/status/<lane>.json, in name order. Read only."""
+    out = []
+    for path in sorted(glob.glob(os.path.join(glob.escape(status_dir or STATUS_DIR), "*.json"))):
+        lane = os.path.splitext(os.path.basename(path))[0]
+        try:
+            with open(path) as fh:
+                out.append((lane, json.load(fh), ""))
+        except (OSError, ValueError) as ex:
+            out.append((lane, None, f"its status file could not be read ({_why(ex)})"))
+    return out
+
+
+def status_strings(data):
+    """[(dotted field path, text, queue_reads_it)] for every string in one status file, except
+    decisions_for_mason and the fields a lane keeps what it has already settled in.
+    queue_reads_it: the string is an entry in a LIST at the top level of the file, which is what
+    queue.py's own scan walks; everything else (the headline, a resume, a goal's note, an entry inside
+    answered_not_acted) is where an ask can sit unread by any counter."""
+    out = []
+
+    def walk(v, path, in_top_list):
+        if isinstance(v, dict):
+            for k, x in v.items():
+                if k == "decisions_for_mason" or _closed_key(k):
+                    continue
+                walk(x, path + [str(k)], False)
+        elif isinstance(v, list):
+            for i, x in enumerate(v):
+                walk(x, path + [str(i)], len(path) == 1)
+        elif isinstance(v, str) and v.strip():
+            out.append((".".join(path), v, bool(in_top_list)))
+
+    walk(data if isinstance(data, dict) else {}, [], False)
+    return out
+
+
+def _repeats_an_ask(text, others):
+    """True when this line says again what the lane's decisions_for_mason entries already ask: at least
+    four fifths of its telling words appear in one entry, or in the entries taken together (a resume
+    restates several of them in one sentence). A headline reading "Waiting on you: confirm the sign-in"
+    points at an entry rather than hiding a second ask."""
+    # Two letters count: "eq", "v2" and "go" are the telling words of "go or change on the EQ V2 plan".
+    words = [w for w in re.findall(r"[a-z0-9.]+", _norm(text)) if len(w) >= 2 and w not in _ASK_STOP]
+    if len(words) < 3:
+        return False
+    pools = [set(re.findall(r"[a-z0-9.]+", _norm(o))) for o in others]
+    if len(pools) > 1:
+        pools.append(set().union(*pools))
+    for have in pools:
+        if sum(1 for w in words if w in have) >= max(3, int(0.8 * len(words))):
+            return True
+    return False
+
+
+def _ask_clause(text, at):
+    """The sentence the marker sits in, cut at ASK_CLAUSE_MAX. A lane's resume is one long string, and
+    reporting the whole paragraph as "an ask" would say nothing about what he is being asked."""
+    pieces, pos = [], 0
+    for sep in _SENTENCE_END.finditer(text):
+        pieces.append((pos, text[pos:sep.start()]))
+        pos = sep.end()
+    pieces.append((pos, text[pos:]))
+    clause = text.strip()
+    for start, s in pieces:
+        if start <= at <= start + len(s):
+            clause = s.strip() or clause
+            break
+    if len(clause) > ASK_CLAUSE_MAX:
+        clause = clause[:ASK_CLAUSE_MAX].rsplit(" ", 1)[0] + ELLIPSIS
+    return clause
+
+
+def hidden_asks(lane, data, listed=(), unjustified=(), decisions=(), paused=False):
+    """Every ask of him written in a lane's status file OUTSIDE decisions_for_mason (Phase 0 item 2),
+    each saying where it sits and whether he can see it at all:
+      on_list            queue.py reads that field, so the item IS on his list, but it is not in the one
+                         place the plan names, so the lane should move it into decisions_for_mason
+      repeats_decision   it says again what a decisions_for_mason entry already asks, so it is not new
+    An ask found here is never added to the list and never counted: that is what "not silently" means.
+    Left out, by queue.py's own rules: history ("CLOSED 11 Sep, on his word ..."), a line the lane says
+    belongs to another lane or board, the fields a lane keeps settled things in, and paused lanes."""
+    out = []
+    for field, text, queue_reads in status_strings(data):
+        why, at = "", 0
+        m = _ASK_MARKER.search(text)
+        if any(_ASK_FIELD.search(p) for p in field.split(".")):
+            why = f"the field itself is named {field}"
+        elif m:
+            why, at = "its own words say it waits on him", m.start()
+        if not why or len(text.strip()) < ASK_MIN_CHARS or _HISTORY_OPEN.match(text):
+            continue
+        clause = _ask_clause(text, at)
+        if _HISTORY_OPEN.match(clause) or any(p.search(clause) for p in _NOT_HIS_LINE):
+            continue
+        n = _norm(text)
+        on_list = any(n == x or n in x for x in listed) or any(n == x or n in x for x in unjustified)
+        out.append({"lane": lane, "field": field, "text": no_em_dash(clause),
+                    "full_text": no_em_dash(text[:600]), "why": why,
+                    "queue_reads_the_field": queue_reads, "on_list": on_list, "paused": bool(paused),
+                    "points_at_list": bool(_POINTS_AT_LIST.search(clause)),
+                    "repeats_decision": (not on_list) and _repeats_an_ask(clause, decisions)})
+    return out
+
+
+def _is_hidden(a):
+    """An ask nothing reads: not on the list, not a pointer at the list, not a repeat of an entry, and
+    not in a lane he has paused."""
+    return not (a["on_list"] or a["points_at_list"] or a["repeats_decision"] or a["paused"])
+
+
+def lane_counts(w):
+    """owner lane -> {"items", "wait_seconds"}, counted from the very items the list shows. THE COUNT
+    (Phase 0 item 1): no number a lane typed anywhere reaches this function."""
+    out = {}
+    for it in (w.get("items") or []):
+        lane = it.get("owner_lane") or it.get("lane") or ""
+        e = out.setdefault(lane, {"items": 0, "wait_seconds": 0})
+        e["items"] += 1
+        e["wait_seconds"] += int(it.get("waited_seconds") or 0)
+    return out
+
+
+def _new_lane_entry():
+    return {"items": 0, "wait_seconds": 0, "status_files": [], "decisions_in_file": None, "typed": [],
+            "mismatch": False, "hidden_asks": [], "hidden_total": 0, "paused_asks": 0,
+            "listed_outside_decisions": [], "paused": False, "problem": "",
+            "roster_sessions": [], "live_roster_sessions": []}
+
+
+def lane_report(w, status_dir=None, roster=None):
+    """Per lane: the count computed from the list, the numbers the lane itself typed, whether they
+    disagree, the items on the list that came from a field other than decisions_for_mason, and the asks
+    written outside it. Every count here comes from the items; a lane's own number is only ever
+    compared with them (Phase 0 items 1 and 2)."""
+    if roster is None:
+        try:
+            roster = _roster_sessions()
+        except (OSError, ValueError):
+            roster = {}
+    out = {}
+    for lane, c in lane_counts(w).items():
+        e = out.setdefault(lane, _new_lane_entry())
+        e["items"], e["wait_seconds"] = c["items"], c["wait_seconds"]
+    listed = {_norm(it.get("text")) for it in (w.get("items") or [])}
+    unjust = {_norm(u.get("text")) for u in (w.get("unjustified") or [])}
+    paused = paused_lanes()
+    for it in (w.get("items") or []):
+        src = it.get("source") or ""
+        if src.startswith("status/") and ":" in src and not src.endswith(":decisions_for_mason"):
+            e = out.setdefault(it.get("owner_lane") or it.get("lane") or "", _new_lane_entry())
+            # id and field only: the text is already in this item, and agents read this over the wire
+            e["listed_outside_decisions"].append({"id": it.get("id"), "field": src.split(":", 1)[1]})
+    for stem, data, problem in read_status(status_dir):
+        lane = item_owner_lane(stem, roster)
+        e = out.setdefault(lane, _new_lane_entry())
+        e["status_files"].append(stem + ".json")
+        if problem:
+            e["problem"] = problem
+            continue
+        decisions = [d if isinstance(d, str) else json.dumps(d)
+                     for d in ((data.get("decisions_for_mason") or []) if isinstance(data, dict) else [])]
+        e["decisions_in_file"] = len(decisions)
+        e["paused"] = e["paused"] or stem in paused or lane in paused
+        if not e["paused"]:
+            for field, text, _reads in status_strings(data):
+                root = field.split(".")[0]
+                for n, words in typed_counts(text, explicit_only=root not in ("headline", "resume")):
+                    e["typed"].append({"where": f"status {field}", "said": n, "words": words})
+        e["hidden_asks"] += hidden_asks(stem, data, listed, unjust, decisions, paused=e["paused"])
+    try:
+        live = live_session_ids()
+    except OSError:
+        live = {}
+    for lane, e in out.items():
+        # Which session roster.json believes is this lane's. When the lane has items but that session is
+        # not running, its items can reach no row in the table, and the row that IS the lane says so too.
+        e["roster_sessions"] = [sid for sid, row in roster.items() if row.get("lane") == lane]
+        e["live_roster_sessions"] = [sid for sid in e["roster_sessions"] if sid in live]
+        e["mismatch"] = any(t["said"] != e["items"] for t in e["typed"])
+        e["hidden_total"] = sum(1 for a in e["hidden_asks"] if _is_hidden(a))
+        e["paused_asks"] = sum(1 for a in e["hidden_asks"] if a["paused"])
+    return out
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1818,20 +2257,22 @@ def first_seen_update(ids, now):
     if changed:
         try:
             os.makedirs(CACHE_DIR, exist_ok=True)
-            disk = _waits_read()
-            for k, v in disk["first_seen"].items():
-                if isinstance(v, (int, float)) and (k not in fs or v < fs[k]):
-                    fs[k] = v
-            for k, v in disk["last_seen"].items():
-                if isinstance(v, (int, float)) and (k not in ls or v > ls[k]):
-                    ls[k] = v
-            for k in [k for k, v in ls.items() if now - v > 30 * 86400]:
-                fs.pop(k, None)
-                ls.pop(k, None)
-            tmp = f"{WAITS_PATH}.{os.getpid()}.tmp"
-            with open(tmp, "w") as fh:
-                json.dump(d, fh, separators=(",", ":"))
-            os.replace(tmp, WAITS_PATH)
+            with _file_lock(WAITS_PATH) as got:       # the re-read, the merge and the write are one step
+                if got:
+                    disk = _waits_read()
+                    for k, v in disk["first_seen"].items():
+                        if isinstance(v, (int, float)) and (k not in fs or v < fs[k]):
+                            fs[k] = v
+                    for k, v in disk["last_seen"].items():
+                        if isinstance(v, (int, float)) and (k not in ls or v > ls[k]):
+                            ls[k] = v
+                    for k in [k for k, v in ls.items() if now - v > 30 * 86400]:
+                        fs.pop(k, None)
+                        ls.pop(k, None)
+                    tmp = f"{WAITS_PATH}.{os.getpid()}.tmp"
+                    with open(tmp, "w") as fh:
+                        json.dump(d, fh, separators=(",", ":"))
+                    os.replace(tmp, WAITS_PATH)
         except OSError:
             pass                                      # unsaved: the next run starts these ids again
     return {i: fs[i] for i in ids if i in fs}
@@ -1845,13 +2286,80 @@ def first_seen_update(ids, now):
 _CROSS_REF = re.compile(r"cross[- ]lane(?:\.md)?(?:\s+board)?[\s,:]*(?:row\s*|#\s*)?(\d{1,3})\b", re.I)
 _LEAD_TAG = re.compile(r"^\s*\[([^\]]{1,120})\]")
 ANSWER_KEY_LEN = 60
-ANSWER_KEY_MIN = 20
+ANSWER_KEY_MIN = 40      # 20 let a run of common words match an unrelated ledger row (15 Sep)
+ANSWER_KEY_FULL_MIN = 12  # under this a whole ask is a word or two, and his one-word answers ("go") would match it
+_ASK_BOILERPLATE = re.compile(r"^(?:waiting on (?:mason|him|you)[^:]{0,80}:|question:|his call:|\d{1,3}[.)])\s*",
+                              re.I)
+_ALONE_LEFT = set('|"\'([:')     # what may stand before a whole-text key: a cell, a quote, a bracket, a label
+_ALONE_RIGHT = set('|"\')]')     # and after it (its own end punctuation first)
+_ALONE_TRAIL = ".?!"
 
 
 def _norm(s):
     s = no_em_dash(s or "").lower().replace("\\", "")
     s = re.sub(r"[*`]", "", s)
     return re.sub(r"\s+", " ", s).strip()
+
+
+def _answer_key(s):
+    """(key, whole): what a ledger must hold for this item to count as answered. The item's own words
+    with the lane's boilerplate opening dropped ("WAITING ON MASON: ", "Question: ", "3. "); with at
+    least ANSWER_KEY_MIN characters left, a PREFIX cut at a word boundary, found as whole words
+    (whole False, _key_in). A shorter ask has no prefix worth trusting, so its WHOLE text is the key and
+    must stand alone in the ledger (whole True, _key_alone): as its own cell, after a label's colon, or
+    quoted, never inside a sentence about something else. Under ANSWER_KEY_FULL_MIN characters: no key.
+
+    The opening is dropped because a prefix key is shared by neighbouring items: on 15 Sep the first 60
+    characters of "WAITING ON MASON: he says yes or no to installing the new VST3 and AU of Clip 2.0"
+    and of the same sentence about Comp 2.2.2 were the same 60 characters, so an answer to either
+    settled both. The minimum rose from 20 because 20 characters of common words ("say go to install
+    it") appear in a ledger about something else entirely (GPT-5.6 Sol review). The first pass then
+    gave short asks no text key at all, so an answer recorded by hand (no item id in the row) never
+    settled them and they lost the tag silently; the whole-text rule is the second pass (15 Sep)."""
+    t = _ASK_BOILERPLATE.sub("", _norm(s), count=1)
+    if len(t) < ANSWER_KEY_MIN:
+        return (t, True) if len(t) >= ANSWER_KEY_FULL_MIN else ("", False)
+    if len(t) > ANSWER_KEY_LEN:
+        t = t[:ANSWER_KEY_LEN]
+        cut = t.rfind(" ")
+        if cut > 0:
+            t = t[:cut]
+    return (t, False) if len(t) >= ANSWER_KEY_MIN else ("", False)
+
+
+def _key_in(norm, key):
+    """The key present in the ledger as whole words: a key butted against letters or digits on both
+    sides is part of a longer word and is not this item."""
+    i = norm.find(key)
+    while i >= 0:
+        before = norm[i - 1] if i else " "
+        after = norm[i + len(key)] if i + len(key) < len(norm) else " "
+        if not (before.isalnum() or after.isalnum()):
+            return True
+        i = norm.find(key, i + 1)
+    return False
+
+
+def _key_alone(norm, key):
+    """The whole-text key standing alone in the ledger: the nearest non-space character before it is a
+    cell pipe, a quote, an opening bracket or a label's colon (or nothing), and after it, past its own
+    end punctuation, a pipe, a quote, a closing bracket (or nothing). "say go to install it" inside
+    "told the EQ lane to say go to install it. nothing else" is not this item; the same words as the
+    subject cell "Reply from the Agents app: Say go to install it." are."""
+    i = norm.find(key)
+    while i >= 0:
+        j = i - 1
+        while j >= 0 and norm[j] == " ":
+            j -= 1
+        k = i + len(key)
+        while k < len(norm) and norm[k] in _ALONE_TRAIL:
+            k += 1
+        while k < len(norm) and norm[k] == " ":
+            k += 1
+        if (j < 0 or norm[j] in _ALONE_LEFT) and (k >= len(norm) or norm[k] in _ALONE_RIGHT):
+            return True
+        i = norm.find(key, i + 1)
+    return False
 
 
 def _answer_keys(item):
@@ -1862,9 +2370,9 @@ def _answer_keys(item):
     except ValueError:
         d = None
     if isinstance(d, dict) and isinstance(d.get("question"), str):
-        keys.append(_norm(d["question"])[:ANSWER_KEY_LEN])
-    keys.append(_norm(text)[:ANSWER_KEY_LEN])
-    return [k for k in keys if len(k) >= ANSWER_KEY_MIN]
+        keys.append(_answer_key(d["question"]))
+    keys.append(_answer_key(text))
+    return [(k, whole) for k, whole in keys if k]      # (key, whole): whole means _key_alone, else _key_in
 
 
 def _ledgers():
@@ -1927,7 +2435,7 @@ def _settled_by_answer(item, ctx):
     keys = _answer_keys(item)
     iid = item.get("id") or ""
     for name, raw, norm in ctx.get("ledgers") or []:
-        if (len(iid) >= 8 and iid in raw) or any(k in norm for k in keys):
+        if (len(iid) >= 8 and iid in raw) or any((_key_alone if whole else _key_in)(norm, k) for k, whole in keys):
             return f"your answer is in {name}"
     return None
 
@@ -2212,18 +2720,21 @@ def _storage_read():
 def _storage_write(d, now):
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
-        disk = _storage_read()
-        seen = {round(t, 3) for t, _ in d["samples"]}
-        d["samples"] += [s for s in disk["samples"] if round(s[0], 3) not in seen]
-        d["samples"] = sorted(s for s in d["samples"] if now - s[0] <= SAMPLE_KEEP)
-        for k, v in disk["first_size"].items():
-            if isinstance(v, list) and len(v) == 2 and (k not in d["first_size"] or v[0] < d["first_size"][k][0]):
-                d["first_size"][k] = v
-        d["first_size"] = {k: v for k, v in d["first_size"].items() if now - v[0] <= 7 * 86400}
-        tmp = f"{STORAGE_PATH}.{os.getpid()}.tmp"
-        with open(tmp, "w") as fh:
-            json.dump(d, fh, separators=(",", ":"))
-        os.replace(tmp, STORAGE_PATH)
+        with _file_lock(STORAGE_PATH) as got:         # samples from two processes must not overwrite
+            if not got:
+                return
+            disk = _storage_read()
+            seen = {round(t, 3) for t, _ in d["samples"]}
+            d["samples"] += [s for s in disk["samples"] if round(s[0], 3) not in seen]
+            d["samples"] = sorted(s for s in d["samples"] if now - s[0] <= SAMPLE_KEEP)
+            for k, v in disk["first_size"].items():
+                if isinstance(v, list) and len(v) == 2 and (k not in d["first_size"] or v[0] < d["first_size"][k][0]):
+                    d["first_size"][k] = v
+            d["first_size"] = {k: v for k, v in d["first_size"].items() if now - v[0] <= 7 * 86400}
+            tmp = f"{STORAGE_PATH}.{os.getpid()}.tmp"
+            with open(tmp, "w") as fh:
+                json.dump(d, fh, separators=(",", ":"))
+            os.replace(tmp, STORAGE_PATH)
     except OSError:
         pass
 
@@ -2449,6 +2960,16 @@ def render_text(rows, w, al=None, store=None, now=None):
                 out.append("    " + ln)
         if r["note"]:
             out.append("    note: " + r["note"])
+        if r.get("waiting_note"):                     # a mismatch, or why the count is "?" or 0 on an unmatched row
+            out.append("    waiting count: " + r["waiting_note"])
+    stale_rows = [r for r in rows if r.get("in_roster") is False]
+    if stale_rows:
+        out.append("")
+        for i, ln in enumerate(textwrap.wrap(
+                f"{len(stale_rows)} of {len(rows)} conversations are in no roster.json row, so no item of the "
+                "list can reach them and their lanes' items are counted by lane below: "
+                + ", ".join(r["title"] for r in stale_rows), 96)):
+            out.append(("" if i else "") + ln)
     out.append("")
     if store is not None:
         out += render_storage(store)
@@ -2470,6 +2991,9 @@ def render_text(rows, w, al=None, store=None, now=None):
                        + (f" {lost} belong to no conversation in the table above." if lost else ""))
         elif w.get("enrich_note"):
             out.append(w["enrich_note"])
+        out += render_lanes(w, rows)
+        if w.get("lanes_note"):
+            out.append(w["lanes_note"])
         out.append("")
         for n, it in enumerate(w["items"], 1):
             mark = "YELLOW" if it["yellow"] else ""
@@ -2495,7 +3019,77 @@ def render_text(rows, w, al=None, store=None, now=None):
                 for i, ln in enumerate(wrapped):
                     out.append(("     - " if i == 0 else "       ") + ln)
             out.append("")
+        out += render_hidden_asks(w)
     return no_em_dash("\n".join(out))
+
+
+def render_lanes(w, rows):
+    """The by-lane block: what waits on him per lane, counted from the items above, beside whatever
+    number that lane's own words claim (Phase 0 item 1)."""
+    lanes = w.get("lanes") or {}
+    if not lanes:
+        return []
+    by_lane = {}
+    for r in (rows or []):
+        if r.get("lane"):
+            by_lane.setdefault(r["lane"], []).append(r.get("title") or r.get("tty") or "?")
+    out = ["", "BY LANE, counted from the items below, never from a number a lane typed:"]
+    for lane in sorted(lanes, key=lambda k: (-lanes[k]["items"], k)):
+        v = lanes[lane]
+        if not (v["items"] or v["typed"] or v["hidden_total"] or v["problem"]):
+            continue
+        line = f'  {_lane_name(lane):<13} {v["items"]:>2} waiting'
+        if v["items"]:
+            line += f', {wait_text(v["wait_seconds"])} together'
+        here = by_lane.get(lane) or []
+        line += "; row: " + (", ".join(here) if here else "none in the table above")
+        if not here and v["items"]:
+            if v["roster_sessions"] and not v["live_roster_sessions"]:
+                line += f' (roster.json names {", ".join(s[:8] for s in v["roster_sessions"])}, not running)'
+            elif not v["roster_sessions"]:
+                line += " (no roster.json row names this lane)"
+        if v["paused"]:
+            line += "; PAUSED by him"
+        out.append(line)
+        if v["mismatch"]:
+            out.append("       MISMATCH, its own words say " + "; ".join(
+                f'{t["said"]} ("{t["words"]}", {t["where"]})' for t in v["typed"] if t["said"] != v["items"]))
+        if v["listed_outside_decisions"]:
+            fields = sorted({x["field"] for x in v["listed_outside_decisions"]})
+            out.append(f'       {len(v["listed_outside_decisions"])} of its items reached the list from '
+                       f'{", ".join(fields)}, not from decisions_for_mason')
+        if v["hidden_total"]:
+            out.append(f'       {v["hidden_total"]} ask{"" if v["hidden_total"] == 1 else "s"} written outside '
+                       "decisions_for_mason, listed at the end")
+        if v["problem"]:
+            out.append("       " + v["problem"])
+    return out
+
+
+def render_hidden_asks(w):
+    """The asks nothing reads, listed last and never counted (Phase 0 item 2)."""
+    every = [a for v in (w.get("lanes") or {}).values() for a in v["hidden_asks"]]
+    hid = [a for a in every if _is_hidden(a)]
+    if not every:
+        return []
+    out = []
+    if hid:
+        out.append(f"Asks written outside decisions_for_mason ({len(hid)}), NOT counted above and NOT added to the "
+                   "list: no counter reads these fields, so each is its lane's to move into decisions_for_mason "
+                   "or drop.")
+        for a in hid:
+            wrapped = textwrap.wrap(f'lane {a["lane"]}, {a["field"]}: {a["text"]}', 96) or [""]
+            for i, ln in enumerate(wrapped):
+                out.append(("     - " if i == 0 else "       ") + ln)
+    kinds = [("on the list from another field", sum(1 for a in every if a["on_list"])),
+             ("pointing at the list itself", sum(1 for a in every if not a["on_list"] and a["points_at_list"])),
+             ("saying again what an entry asks", sum(1 for a in every if not a["on_list"] and not a["points_at_list"]
+                                                     and a["repeats_decision"])),
+             ("in a lane he has paused", sum(1 for a in every if a["paused"] and not a["on_list"]))]
+    out.append(f"Other lines that say they wait on him, left out of that list: "
+               + ", ".join(f"{n} {label}" for label, n in kinds if n) + ".")
+    out.append("")
+    return out
 
 
 def main(argv):
@@ -2603,7 +3197,7 @@ class _T:
 def _bash_done(task_id, uid):
     # Modelled on transcript 96909c09: a background command completion.
     return ("<task-notification>\n<task-id>%s</task-id>\n<tool-use-id>%s</tool-use-id>\n"
-            "<output-file>/private/tmp/claude-501/-Users-masondreiling/96909c09/tasks/%s.output</output-file>\n"
+            "<output-file>/private/tmp/claude-501/-Users-you/96909c09/tasks/%s.output</output-file>\n"
             "<status>completed</status>\n<summary>Background command \"Wait for preview run to finish\" "
             "completed (exit code 0)</summary>\n</task-notification>" % (task_id, uid, task_id))
 
@@ -2611,7 +3205,7 @@ def _bash_done(task_id, uid):
 def _bash_launched(task_id):
     # Modelled on transcript 7586d3af, a Bash run_in_background result.
     return ("Command running in background with ID: %s. Output is being written to: "
-            "/private/tmp/claude-501/-Users-masondreiling/7586d3af/tasks/%s.output. You will be notified "
+            "/private/tmp/claude-501/-Users-you/7586d3af/tasks/%s.output. You will be notified "
             "when it completes. To check interim output, use Read on that file path." % (task_id, task_id))
 
 
@@ -2880,7 +3474,7 @@ def selftest():
     # 16. A foreground Bash call moved to the background after its timeout: both wordings, with and
     # without toolUseResult, then its terminal notification. Output that QUOTES the phrase is not a launch.
     moved = ("Command did not complete within its 120s timeout and was moved to the background (ID: b38mbyewb). "
-             "Output is being written to: /private/tmp/claude-501/-Users-masondreiling/42e71f59-d436-4167-8e5e-"
+             "Output is being written to: /private/tmp/claude-501/-Users-you/42e71f59-d436-4167-8e5e-"
              "f9bedd0dc067/tasks/b38mbyewb.output. You will be notified when it completes. To check interim "
              "output, use Read on that file path.")
     T = _T()
@@ -3277,8 +3871,11 @@ def selftest():
     detail25, ok25 = "", False
     try:
         led_raw = ("# ANSWERS 2026-09-10\n\n| subject | when, how | his words |\n|---|---|---|\n"
-                   "| reply from the Agents app | 21:30, about: [row 20] Pocket Fund: the go to build phases 0 and 1 "
-                   "against his three rules | \"go\" |\n| reply | item id 7f3e9a1c2b | \"no\" |\n")
+                   "| reply from the Agents app | 21:30, about: [row 20] Travel Fund: the go to build phases 0 and 1 "
+                   "against his three rules | \"go\" |\n| reply | item id 7f3e9a1c2b | \"no\" |\n"
+                   "| install the Comp | 22:10, in his words | WAITING ON MASON: he says yes or no to installing the "
+                   "new VST3 and AU of Comp 2.2.2, because it replaces what he has installed | \"go\" |\n"
+                   "| the EQ preset | 21:05, relayed | told the EQ lane to say go to install it. nothing else | \"yes\" |\n")
         board = ("# CROSS-LANE\n\n| # | since | what | from | affects | do |\n|---|---|---|---|---|---|\n"
                  "| 11 | 10 Sep | open row | a | b | c |\n| 14 | 10 Sep | listed twice | a | b | c |\n\n## CLOSED\n\n"
                  "| 12 | 10 Sep | closed row | a | b | c | CLOSED 19:4x: done |\n| 14 | 10 Sep | again | a | b | c | CLOSED |\n")
@@ -3286,7 +3883,7 @@ def selftest():
         ctx = {"now": now0, "ledgers": [("ANSWERS-test.md", led_raw, _norm(led_raw))], "cross": parse_cross_lane(board),
                "mtime": lambda p: {eqp: now0 - 3600}.get(p), "last_human": lambda lane: {"eq": now0 - 600}.get(lane)}
         cases25 = [
-            ("answer by its text", {"id": "a1", "text": "[row 20] Pocket  Fund: the go to **build** phases 0 and 1 against his three rules, a long item"}, "your answer is in ANSWERS-test.md"),
+            ("answer by its text", {"id": "a1", "text": "[row 20] Travel  Fund: the go to **build** phases 0 and 1 against his three rules, a long item"}, "your answer is in ANSWERS-test.md"),
             ("answer by its id", {"id": "7f3e9a1c2b", "text": "something else entirely, never answered in words"}, "your answer is in ANSWERS-test.md"),
             ("no answer", {"id": "a2", "text": "[row 21] a question nobody has answered yet at all"}, ""),
             ("file gone", {"id": "w1", "text": "move it", "world": "STALE"}, "a file it names is gone"),
@@ -3299,6 +3896,14 @@ def selftest():
              {"id": "r1", "text": "q", "source": "status/eq.json:next", "owner_lane": "eq"}, ""),
             ("record rewritten after", {"id": "r2", "text": "q", "source": "status/eq.json:next", "owner_lane": "clip"}, ""),
             ("a listening folder", {"id": "r3", "text": "q", "source": "listening folders", "owner_lane": "eq"}, ""),
+            # 15 Sep: a key must be long enough and its own, or an answer settles a different question
+            ("a short run of common words is not an answer", {"id": "sc1", "text": "Say go to install it."}, ""),
+            ("two items opening with the same 60 characters: the Clip one is not settled by the Comp answer",
+             {"id": "sc2", "text": "WAITING ON MASON: he says yes or no to installing the new VST3 and AU of Clip 2.0, "
+                                   "because it replaces what he has installed"}, ""),
+            ("the item that answer was really about",
+             {"id": "sc3", "text": "WAITING ON MASON: he says yes or no to installing the new VST3 and AU of Comp 2.2.2, "
+                                   "because it replaces what he has installed"}, "your answer is in ANSWERS-test.md"),
         ]
         bad25 = []
         for name, it, want in cases25:
@@ -3321,12 +3926,28 @@ def selftest():
             caught25 = it25["may_be_settled"] is True
         finally:
             g25["SETTLE_CHECKS"] = saved25
-        ok25 = not bad25 and broken["may_be_settled"] is False and hint_ok and caught25
+        # sabotage 2: the old ledger key rule (20 characters, boilerplate opening kept) must settle the
+        # two items above that nothing answered
+        saved_min, saved_boiler = g25["ANSWER_KEY_MIN"], g25["_ASK_BOILERPLATE"]
+        g25["ANSWER_KEY_MIN"], g25["_ASK_BOILERPLATE"] = 20, re.compile(r"^(?!)")
+        try:
+            false25 = []
+            for name, it, want in cases25:
+                if want or it["id"] not in ("sc1", "sc2"):
+                    continue
+                probe = dict(it)
+                settle_fields(probe, ctx)
+                false25.append(probe["may_be_settled"])
+        finally:
+            g25["ANSWER_KEY_MIN"], g25["_ASK_BOILERPLATE"] = saved_min, saved_boiler
+        caught25b = len(false25) == 2 and all(false25)
+        ok25 = not bad25 and broken["may_be_settled"] is False and hint_ok and caught25 and caught25b
         detail25 = (f"{len(cases25) - len(bad25)} of {len(cases25)} cases as expected"
                     + (f"; wrong: {'; '.join(bad25[:3])}" if bad25 else "")
                     + f"; with nothing readable the item stays open {broken['may_be_settled'] is False}"
                     + f"; silence reason kept as a checker hint only {hint_ok}"
-                    + f"; sabotage (silence back in SETTLE_CHECKS) makes it fail {caught25}")
+                    + f"; sabotage (silence back in SETTLE_CHECKS) makes it fail {caught25}"
+                    + f"; sabotage (the old 20-character key) falsely settles {sum(false25)} of 2 {caught25b}")
     except Exception as ex:
         detail25 = f"could not run: {type(ex).__name__}: {ex}"
     check(25, "may be settled: only the strong checks (answer ledger, file gone, its CROSS-LANE row closed); silence dropped",
@@ -3349,11 +3970,13 @@ def selftest():
         fsd = {f"i{k}": now0 - 3600 * (k + 1) for k in range(len(lanes))}
         enrich(w26, now0, {"now": now0, "roster": roster, "live": live, "stack_states": {}, "ledgers": [], "cross": {},
                            "mtime": lambda p: None, "last_human": lambda lane: None}, fsd)
-        rows26 = [{"session_id": sid} for sid in ("s-coord", "s-samp", "s-eq", "s-other")] + [{"session_id": None}]
+        # s-other is in no roster row while level's and ghost's items have no live owner: "?", never 0 (second pass)
+        rows26 = [{"session_id": sid, "in_roster": sid in roster}
+                  for sid in ("s-coord", "s-samp", "s-eq", "s-other")] + [{"session_id": None}]
         attach_waits(rows26, w26)
         got = [(r["session_id"], r.get("decisions_waiting"), r.get("total_wait_seconds")) for r in rows26]
         want = [("s-coord", 3, 3600 * (1 + 2 + 3)), ("s-samp", 2, 3600 * (4 + 5)), ("s-eq", 1, 3600 * 6),
-                ("s-other", 0, 0), (None, None, None)]
+                ("s-other", None, None), (None, None, None)]
         n_sum = sum(r.get("decisions_waiting") or 0 for r in rows26) + w26["unowned"]
         t_sum = sum(r.get("total_wait_seconds") or 0 for r in rows26) + w26["unowned_wait_seconds"]
         failed = [{"session_id": "s-coord"}]
@@ -3660,6 +4283,387 @@ def selftest():
         ok33, detail33 = False, f"could not run: {type(ex).__name__}: {ex}"
     check(33, "asks without a reason (SPEC 11): passed through with their lanes, never counted", ok33, detail33,
           "queue.py build(): 'unjustified' lines, WAITING ON MASON without 'because' (fence 50)")
+
+    # 34. (15 Sep, REDESIGN-PLAN Phase 0 item 1) Every count comes from the items the list shows. A number a
+    # lane typed is only ever compared with that count, and where they differ the lane and the row say both.
+    detail34, ok34 = "", False
+
+    def _put_json(path, obj):
+        with open(path, "w") as fh:
+            json.dump(obj, fh)
+    try:
+        lanes34 = ["level"] * 4 + ["sampler"] * 8 + ["eq"] * 2 + ["stack"]
+        w34 = waiting_from_manifest({"total": len(lanes34), "counts": {"decision": len(lanes34)}, "sha": "t34",
+                                     "items": [{"id": f"m{k}", "lane": ln, "bucket": "decision", "text": f"ask {k}",
+                                                "source": f"status/{ln}.json:decisions_for_mason"}
+                                               for k, ln in enumerate(lanes34)]})
+        roster34 = {"s-lvl": {"lane": "level", "status_file": "level.json"},
+                    "s-samp": {"lane": "sampler", "status_file": "sampler.json"},
+                    "s-eq": {"lane": "eq", "status_file": "eq.json"},
+                    "s-coord": {"lane": "coordinator", "status_file": None}}
+        enrich(w34, now0, {"now": now0, "roster": roster34, "live": {"s-lvl": 1, "s-samp": 2, "s-coord": 3},
+                           "stack_states": {}, "ledgers": [], "cross": {}, "mtime": lambda p: None,
+                           "last_human": lambda l: None}, {f"m{k}": now0 - 600 for k in range(len(lanes34))})
+        sdir34 = os.path.join(sdir, "status34")
+        os.makedirs(sdir34, exist_ok=True)
+        # The Leveller's own words on 15 Sep: its headline said three, its resume four, its list held four.
+        _put_json(os.path.join(sdir34, "level.json"),
+                  {"headline": "A plan, three mockups and a skill. Three questions sit on him, the oldest open "
+                               "since 7 Sep.",
+                   "resume": "Waiting on him: 4 six-part decisions in decisions_for_mason.",
+                   "decisions_for_mason": ["1. one", "2. two", "3. three", "4. four"]})
+        _put_json(os.path.join(sdir34, "sampler.json"),
+                  {"headline": "Zone view work goes on.",
+                   "next": ["HIS BOARD: the eight entries in decisions_for_mason stand as written."],
+                   "decisions_for_mason": ["a"] * 8})
+        _put_json(os.path.join(sdir34, "maximizer.json"),
+                  {"headline": "CLOSED 11 Sep on his word. The one item that was waiting on him moved to the "
+                               "Leveller.", "decisions_for_mason": []})
+        rep34 = lane_report(w34, status_dir=sdir34, roster=roster34)
+        w34["lanes"] = rep34
+        counted34 = {k: v["items"] for k, v in rep34.items() if v["items"]}
+        counts_ok = (counted34 == {"level": 4, "sampler": 8, "eq": 2, "coordinator": 1}
+                     and sum(v["items"] for v in rep34.values()) == w34["total"])
+        typed_ok = (sorted(t["said"] for t in rep34["level"]["typed"]) == [3, 4] and rep34["level"]["mismatch"] is True
+                    and [t["said"] for t in rep34["sampler"]["typed"]] == [8]
+                    and rep34["sampler"]["mismatch"] is False and rep34["maximizer"]["typed"] == [])
+        rows34 = [{"session_id": "s-lvl", "lane": "level", "in_roster": True, "summary": None,
+                   "headline": {"visible": "Waiting on you: 5 Leveller decisions, linked clips first"}},
+                  {"session_id": "s-samp", "lane": "sampler", "in_roster": True, "summary": None,
+                   "headline": {"visible": "Waiting on you: 8 sampler decisions"}},
+                  {"session_id": "s-new", "lane": None, "in_roster": False, "headline": None, "summary": None}]
+        attach_waits(rows34, w34)
+        row_ok = (rows34[0]["decisions_waiting"] == 4 and rows34[0]["waiting_mismatch"] is True
+                  and "4 on the list" in rows34[0]["waiting_note"] and "says 5" in rows34[0]["waiting_note"]
+                  and "says 3" in rows34[0]["waiting_note"]
+                  and rows34[1]["waiting_mismatch"] is False and rows34[1]["waiting_note"] == ""
+                  and rows34[2]["waiting_mismatch"] is False
+                  and "no roster.json row" in rows34[2]["waiting_note"])
+        pure34 = (typed_counts("Three questions sit on him, the oldest open since 7 Sep.") == [(3, "Three questions sit on him")]
+                  and [n for n, _t in typed_counts("Waiting on you: 5 Leveller decisions, linked clips first")] == [5]
+                  and [n for n, _t in typed_counts("the eight entries in decisions_for_mason")] == [8]
+                  and typed_counts("Waiting on you: export one song on Fast") == []
+                  and typed_counts("One decision for him: whether EQs follow.", explicit_only=True) == [])
+        g34 = globals()
+        saved34 = g34["lane_counts"]
+        g34["lane_counts"] = lambda w: {"level": {"items": 3, "wait_seconds": 0}}   # sabotage: believe the typed 3
+        try:
+            sab34 = lane_report(w34, status_dir=sdir34, roster=roster34)
+            caught34 = sab34["level"]["mismatch"] is False or {k: v["items"] for k, v in sab34.items() if v["items"]} != counted34
+        finally:
+            g34["lane_counts"] = saved34
+        ok34 = counts_ok and typed_ok and row_ok and pure34 and caught34
+        detail34 = (f"per lane from the items {counted34}, and they add to the manifest total {w34['total']}; "
+                    f"level typed {[t['said'] for t in rep34['level']['typed']]} against 4 computed, mismatch "
+                    f"{rep34['level']['mismatch']}; sampler typed 8 against 8, mismatch {rep34['sampler']['mismatch']}; "
+                    f"a closed lane's past tense reads no number {rep34['maximizer']['typed'] == []}; the row says "
+                    f'"{rows34[0]["waiting_note"]}"; sabotage (a count taken from the typed number) makes it fail {caught34}')
+    except Exception as ex:
+        detail34 = f"could not run: {type(ex).__name__}: {ex}"
+    check(34, "counts computed, never typed: per lane from the list's own items, a lane's own number only compared "
+          "with it, the row marked where they differ", ok34, detail34,
+          "level.json 15 Sep headline 'Three questions sit on him' and resume 'Waiting on him: 4 six-part decisions' "
+          "with 4 entries; the Leveller row's headline 'Waiting on you: 5 Leveller decisions' while its 4 items "
+          "counted on no row (roster.json names 1bc5f7c1, the live session is d0da2aea)")
+
+    # 35. (15 Sep, Phase 0 item 2) An ask written anywhere but decisions_for_mason is REPORTED, never added to
+    # the list and never counted. The plan's own control: plant one in a lane's "next" field.
+    detail35, ok35 = "", False
+    try:
+        sdir35 = os.path.join(sdir, "status35")
+        os.makedirs(sdir35, exist_ok=True)
+        planted35 = ("UNFINISHED: the low band. WAITING ON MASON'S HANDS: his hand on the Freq knob in the "
+                     "plugin's own window, because only he can feel it.")
+        on_list35 = "WAITING ON MASON: say go on the V2 plan, because only he can and it is his call."
+        _put_json(os.path.join(sdir35, "eq.json"), {
+            "headline": "Waiting on you: go or change on the EQ V2 plan",
+            "installed": "EQ 2.1 installed on his word 7 Sep, both formats, no question open.",
+            "next": [on_list35,
+                     "CLOSED 9 Sep, answered by him: WAITING ON MASON: the old Rosetta question, settled.",
+                     planted35],
+            "goals": [{"goal": "quality", "note": "Part B of the CPU baseline waits on Mason: his own CPU meter "
+                                                  "reading on the open project."}],
+            "running": ["A build is running; no question of his is open on it."],
+            "resume": {"still_waiting_on_his_words": "which of the three plans he wants first, V2 or the filters"},
+            "answered_not_acted": [{"question": "q", "his_words": "yes", "when": "2026-09-10",
+                                    "blocked_on": "needs Mason to run the installer himself, we cannot."}],
+            "decisions_resolved": ["WAITING ON MASON: an old settled question that must never be reported again."],
+            "decisions_for_mason": ["Say go or change on the EQ V2 plan, because it is his call."]})
+        _put_json(os.path.join(sdir35, "room.json"), {          # a lane he paused: never an ask of his
+            "headline": "Paused.", "next": ["WAITING ON MASON'S HANDS: gate 0 first, because he must click it."],
+            "decisions_for_mason": []})
+        w35 = waiting_from_manifest({"total": 1, "counts": {"decision": 1}, "sha": "t35",
+                                     "items": [{"id": "e1", "lane": "eq", "bucket": "decision", "text": on_list35,
+                                                "source": "status/eq.json:next"}]})
+        enrich(w35, now0, {"now": now0, "roster": {"s-eq": {"lane": "eq", "status_file": "eq.json"}},
+                           "live": {"s-eq": 1}, "stack_states": {}, "ledgers": [], "cross": {},
+                           "mtime": lambda p: None, "last_human": lambda l: None}, {"e1": now0 - 60})
+        rep35 = lane_report(w35, status_dir=sdir35, roster={"s-eq": {"lane": "eq", "status_file": "eq.json"}})
+        w35["lanes"] = rep35
+        eq35 = rep35["eq"]
+        hid35 = sorted(a["field"] for a in eq35["hidden_asks"] if _is_hidden(a))
+        want35 = ["answered_not_acted.0.blocked_on", "goals.0.note", "next.2", "resume.still_waiting_on_his_words"]
+        marks35 = {a["field"]: (a["on_list"], a["repeats_decision"], a["paused"]) for a in eq35["hidden_asks"]}
+        not_counted35 = (w35["total"] == 1 and len(w35["items"]) == 1 and eq35["items"] == 1
+                         and eq35["hidden_total"] == 4)
+        text35 = "\n".join(render_hidden_asks(w35) + render_lanes(w35, []))
+        cli35 = ("next.2" in text35 and "his hand on the Freq knob" in text35
+                 and "4 asks written outside decisions_for_mason" in text35
+                 and "an old settled question" not in text35 and "gate 0 first" not in text35)
+        room35 = [a for a in rep35["room"]["hidden_asks"]]
+        paused35 = rep35["room"]["paused"] is True and rep35["room"]["hidden_total"] == 0 and len(room35) == 1
+        g35 = globals()
+        saved35 = g35["hidden_asks"]
+        g35["hidden_asks"] = lambda *a, **k: []                 # sabotage: skip them, as before today
+        try:
+            sab35 = lane_report(w35, status_dir=sdir35, roster={})
+            caught35 = sum(v["hidden_total"] for v in sab35.values()) == 0
+        finally:
+            g35["hidden_asks"] = saved35
+        ok35 = (hid35 == want35 and not_counted35 and cli35 and paused35 and caught35
+                and marks35.get("headline") == (False, True, False)
+                and marks35.get("next.0") == (True, False, False))
+        detail35 = (f"hidden {hid35} (wanted {want35}); the headline that repeats an entry is not hidden "
+                    f"{marks35.get('headline')}; the ask queue.py reads from next is marked on the list "
+                    f"{marks35.get('next.0')}; history and a settled field are not reported; a paused lane's ask is "
+                    f"kept out {paused35}; the list still holds {w35['total']} item and counts it once "
+                    f"{not_counted35}; sabotage (asks skipped) makes it fail {caught35}")
+    except Exception as ex:
+        detail35 = f"could not run: {type(ex).__name__}: {ex}"
+    check(35, "hidden asks: every ask outside decisions_for_mason is found and reported with its field, never added "
+          "to the list or counted; history, settled fields and paused lanes are left out", ok35, detail35,
+          "eq.json next 'Part B of the CPU baseline waits on Mason'; midi.json resume.still_waiting_on_his_words; "
+          "sampler.json answered_not_acted blocked_on 'needs Mason to run it or grant it'")
+
+    # 36. (15 Sep, Phase 0 item 3) Every cache write takes a cross-process lock, so two processes cannot lose
+    # each other's work; a lock another process holds for too long leaves the file alone instead of hanging.
+    saved36 = (WAITS_PATH, STORAGE_PATH, STATE_PATH, LOCK_WAIT_S, _MEM["state"], _MEM["disk_mtime"])
+    detail36, ok36 = "", False
+    g36 = globals()
+    try:
+        WAITS_PATH = os.path.join(sdir, "lock-waits.json")
+        STORAGE_PATH = os.path.join(sdir, "lock-storage.json")
+        g36["STATE_PATH"] = os.path.join(sdir, "lock-state.json")
+        _MEM["state"] = {"engine": ENGINE_VERSION, "files": {}}
+        _MEM["disk_mtime"] = None
+        waited36 = []
+        for name, path, writer in (("waits.json", WAITS_PATH, lambda: first_seen_update(["lock-probe"], now0)),
+                                   ("storage.json", STORAGE_PATH,
+                                    lambda: _storage_write({"samples": [[now0, 1.0]], "first_size": {}}, now0)),
+                                   ("the transcript cache", STATE_PATH, _save_cache)):
+            holder = open(path + ".lock", "a")
+            fcntl.flock(holder, fcntl.LOCK_EX)              # as another agent's monitor_data, mid-write
+            th = threading.Thread(target=writer, daemon=True)
+            th.start()
+            time.sleep(0.3)
+            during = os.path.exists(path)
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()
+            th.join(5)
+            waited36.append((name, during, os.path.exists(path)))
+        held_ok = all(not during and after for _n, during, after in waited36)
+        # it gives up rather than hanging when the other process keeps the lock
+        g36["LOCK_WAIT_S"] = 0.2
+        gave_up = open(STORAGE_PATH + ".lock", "a")
+        fcntl.flock(gave_up, fcntl.LOCK_EX)
+        os.remove(STORAGE_PATH)
+        t0 = time.time()
+        _storage_write({"samples": [[now0, 2.0]], "first_size": {}}, now0)
+        took = time.time() - t0
+        skipped = not os.path.exists(STORAGE_PATH)
+        fcntl.flock(gave_up, fcntl.LOCK_UN)
+        gave_up.close()
+        g36["LOCK_WAIT_S"] = saved36[3]
+        # four processes writing the same cache at once: every id survives
+        os.remove(WAITS_PATH)
+        child = os.path.join(sdir, "child36.py")
+        with open(child, "w") as fh:
+            fh.write("import importlib.util, sys, time\n"
+                     "spec = importlib.util.spec_from_file_location('md', sys.argv[1])\n"
+                     "md = importlib.util.module_from_spec(spec); spec.loader.exec_module(md)\n"
+                     "md.CACHE_DIR, md.WAITS_PATH = sys.argv[2], sys.argv[3]\n"
+                     "for k in range(30):\n"
+                     "    md.first_seen_update(['%s-%d' % (sys.argv[4], k)], time.time())\n")
+        procs = [subprocess.Popen([sys.executable, child, os.path.abspath(__file__), sdir, WAITS_PATH, f"p{n}"])
+                 for n in range(4)]
+        for p in procs:
+            p.wait(timeout=120)
+        kept = len(_waits_read()["first_seen"])
+        saved_lock = g36["_file_lock"]
+
+        @contextlib.contextmanager
+        def no_lock(path):                                  # sabotage: today's write with no lock at all
+            yield True
+        g36["_file_lock"] = no_lock
+        try:
+            os.remove(WAITS_PATH)
+            holder = open(WAITS_PATH + ".lock", "a")
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            th = threading.Thread(target=lambda: first_seen_update(["sabotage"], now0), daemon=True)
+            th.start()
+            time.sleep(0.3)
+            caught36 = os.path.exists(WAITS_PATH)           # it wrote straight through another process's lock
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()
+            th.join(5)
+        finally:
+            g36["_file_lock"] = saved_lock
+        ok36 = held_ok and skipped and took < 2.0 and kept == 120 and caught36
+        detail36 = ("; ".join(f"{n}: written while another held the lock {d}, after release {a}"
+                              for n, d, a in waited36)
+                    + f"; a lock held past {saved36[3]:g} s leaves the file unwritten {skipped} after {took:.2f} s"
+                    + f"; 4 processes writing 30 ids each kept {kept} of 120"
+                    + f"; sabotage (no lock) writes through a held lock {caught36}")
+    except Exception as ex:
+        detail36 = f"could not run: {type(ex).__name__}: {ex}"
+    finally:
+        WAITS_PATH, STORAGE_PATH = saved36[0], saved36[1]
+        g36["STATE_PATH"], g36["LOCK_WAIT_S"] = saved36[2], saved36[3]
+        _MEM["state"], _MEM["disk_mtime"] = saved36[4], saved36[5]
+    check(36, "the caches take a cross-process lock: a write waits for another process, gives up rather than "
+          "hanging, and four processes at once lose nothing", ok36, detail36,
+          "waits.json, storage.json and state-v5.json are read, merged and replaced; two monitor_data runs at once "
+          "could each write back what it read before the other's write")
+
+    # 37. (15 Sep, second pass, loose end A) The CLI table prints "?" where no item could reach the row, never
+    # a bare 0: a session in no roster.json row, while some item has no live owner, reads "?" with its note under
+    # it; a roster session whose lane holds nothing reads a true 0; with every item owned by a live session
+    # elsewhere the unmatched row reads 0 and its note says why. Sabotage: the old rule (count by session only).
+    detail37, ok37 = "", False
+    try:
+        roster37 = {"s-a": {"lane": "alpha", "status_file": "alpha.json"},
+                    "s-idle": {"lane": "width", "status_file": "width.json"},
+                    "s-b": {"lane": "beta", "status_file": "beta.json"}}
+        lanes37 = ["alpha", "alpha", "beta"]
+
+        def world37(live):
+            w_ = waiting_from_manifest({"total": 3, "counts": {"decision": 3}, "sha": "t37",
+                                        "items": [{"id": f"q{k}", "lane": ln, "bucket": "decision", "text": f"ask {k}",
+                                                   "source": f"status/{ln}.json:decisions_for_mason"}
+                                                  for k, ln in enumerate(lanes37)]})
+            enrich(w_, now0, {"now": now0, "roster": roster37, "live": live, "stack_states": {}, "ledgers": [],
+                              "cross": {}, "mtime": lambda p: None, "last_human": lambda l: None},
+                   {f"q{k}": now0 - 3600 for k in range(3)})
+            return w_
+
+        def rows37():
+            return [dict(demo_rows[0], title=t, session_id=sid, lane=(roster37.get(sid) or {}).get("lane"),
+                         in_roster=sid in roster37, headline=None, summary=None, description="")
+                    for t, sid in (("Alpha", "s-a"), ("Idle", "s-idle"), ("Fresh", "s-new"))]
+
+        def cli37(w_):
+            rows_ = attach_waits(rows37(), w_)
+            lines_ = render_text(rows_, w_).split("\n")
+            line_, note_ = {}, {}
+            for k, r_ in enumerate(rows_, 1):
+                i_ = next(i for i, l in enumerate(lines_) if l.startswith(f'{k:>2}  {r_["title"]}'))
+                line_[r_["title"]] = lines_[i_]
+                note_[r_["title"]] = ""
+                for l in lines_[i_ + 1:]:                 # the lines under this row only, up to the next row
+                    if not l.strip() or re.match(r"^\s*\d+  \S", l):
+                        break
+                    if l.strip().startswith("waiting count:"):
+                        note_[r_["title"]] = l.strip()
+                        break
+            return rows_, line_, note_
+
+        def cell37(dw, tw):
+            return f"{dw:>14}  {tw:>10}"              # the table's last two columns, as render_text lays them out
+        # beta's roster session is not running: its item has no live owner, so it could be Fresh's
+        r37, l37, n37 = cli37(world37({"s-a": 1, "s-idle": 2}))
+        unknown_ok = (cell37("?", "?") in l37["Fresh"] and cell37("0", "none") not in l37["Fresh"]
+                      and "no roster.json row" in n37["Fresh"] and "1 item on the list has no live owner" in n37["Fresh"]
+                      and "not known" in n37["Fresh"])
+        true_zero_ok = cell37("0", "none") in l37["Idle"] and n37["Idle"] == ""
+        counted_ok = cell37("2", wait_text(7200)) in l37["Alpha"]
+        # every item owned by a live session elsewhere: the unmatched row reads 0, and says why
+        r37b, l37b, n37b = cli37(world37({"s-a": 1, "s-idle": 2, "s-b": 3}))
+        owned_ok = (cell37("0", "none") in l37b["Fresh"] and "no roster.json row" in n37b["Fresh"]
+                    and "owned by a live session elsewhere" in n37b["Fresh"])
+        json_ok = r37[2]["decisions_waiting"] is None and r37b[2]["decisions_waiting"] == 0
+        g37 = globals()
+        saved37 = g37["row_count"]
+        g37["row_count"] = lambda row, by, unowned: by.get(row["session_id"], (0, 0))   # sabotage: the old rule
+        try:
+            _r, l37s, _n = cli37(world37({"s-a": 1, "s-idle": 2}))
+            caught37 = cell37("0", "none") in l37s["Fresh"]
+        finally:
+            g37["row_count"] = saved37
+        ok37 = unknown_ok and true_zero_ok and counted_ok and owned_ok and json_ok and caught37
+        detail37 = (f'unmatched row: "{l37["Fresh"].strip()}" {unknown_ok}; its note: "{n37["Fresh"]}"; '
+                    f"a roster session with nothing waiting reads 0 {true_zero_ok}; the counted row reads 2 {counted_ok}; "
+                    f"with every item owned elsewhere the unmatched row reads 0 and says why {owned_ok}; "
+                    f"JSON None then 0 {json_ok}; sabotage (the old count-by-session rule) prints a bare 0 {caught37}")
+    except Exception as ex:
+        detail37 = f"could not run: {type(ex).__name__}: {ex}"
+    check(37, "the CLI table prints ? where no item could reach the row, never a bare 0, with its reason under it",
+          ok37, detail37,
+          "15 Sep 12:0x checker: 'the CLI table still printed a bare 0 where the window shows ?' on 14 of 16 rows "
+          "whose roster.json session was the 10 Sep one")
+
+    # 38. (15 Sep, second pass, loose end D) A short ask (under ANSWER_KEY_MIN characters) is settled by its WHOLE
+    # text standing alone in a ledger (its own cell, after a label's colon, or quoted), never by those words inside
+    # a sentence about something else; under ANSWER_KEY_FULL_MIN it has no text key, so his one-word answers never
+    # match it. Sabotage 1: whole words anywhere (the prefix rule) settles the embedded case. Sabotage 2: no key
+    # for short asks (the first pass) leaves the real one unsettled.
+    detail38, ok38 = "", False
+    try:
+        led38 = ("# ANSWERS 2026-09-15\n\n| subject | when, how | his words |\n|---|---|---|\n"
+                 "| Reply from the Agents app: Say go to install it. | his words, typed in the Agents app 21:05 EDT, "
+                 "to the EQ window (lane eq), item zz9zz9zz9z | \"go\" |\n"
+                 "| the knob | 21:07, relayed | he said to pick the knob. later he took it back | \"no\" |\n"
+                 "| Which port for the Leveller? | typed to WORKFLOW, 15 Sep | \"the second one\" |\n"
+                 "| one word | 21:09 | his answer, quoted: \"go\" |\n")
+        ctx38 = {"now": now0, "ledgers": [("ANSWERS-t38.md", led38, _norm(led38))], "cross": {},
+                 "mtime": lambda p: None, "last_human": lambda l: None}
+        cases38 = [
+            ("a short ask the app recorded (its id not in the row)", "Say go to install it.", True),
+            ("the same ask with its lane's opening", "WAITING ON MASON: say go to install it.", True),
+            ("a short ask recorded by hand as its own cell", "Which port for the Leveller?", True),
+            ("the same without its question mark", "Which port for the Leveller", True),
+            ("a short ask whose words sit inside a sentence about something else", "Pick the knob.", False),
+            ("a two-letter ask against his quoted one-word answer", "go", False),
+            ("a short ask nobody answered", "Which port for the Comp?", False),
+        ]
+        bad38 = []
+        for name, text, want in cases38:
+            it = {"id": "n38", "text": text}
+            settle_fields(it, ctx38)
+            if it["may_be_settled"] != want:
+                bad38.append(f"{name}: {it['may_be_settled']} (wanted {want})")
+        whole_ok = _answer_keys({"id": "n38", "text": "Say go to install it."}) == [("say go to install it.", True)]
+        long38 = _answer_keys({"id": "n38", "text": "[row 20] Travel Fund: the go to build phases 0 and 1 against "
+                                                    "his three rules, a long item"})
+        prefix_ok = len(long38) == 1 and long38[0][1] is False and len(long38[0][0]) >= ANSWER_KEY_MIN
+        g38 = globals()
+        saved38 = g38["_key_alone"]
+        g38["_key_alone"] = _key_in                       # sabotage 1: whole words anywhere, the prefix rule
+        try:
+            probe = {"id": "n38", "text": "Pick the knob."}
+            settle_fields(probe, ctx38)
+            caught38a = probe["may_be_settled"] is True
+        finally:
+            g38["_key_alone"] = saved38
+        saved38b = g38["ANSWER_KEY_FULL_MIN"]
+        g38["ANSWER_KEY_FULL_MIN"] = ANSWER_KEY_MIN        # sabotage 2: short asks get no text key (first pass)
+        try:
+            probe = {"id": "n38", "text": "Say go to install it."}
+            settle_fields(probe, ctx38)
+            caught38b = probe["may_be_settled"] is False
+        finally:
+            g38["ANSWER_KEY_FULL_MIN"] = saved38b
+        ok38 = not bad38 and whole_ok and prefix_ok and caught38a and caught38b
+        detail38 = (f"{len(cases38) - len(bad38)} of {len(cases38)} cases as expected"
+                    + (f"; wrong: {'; '.join(bad38)}" if bad38 else "")
+                    + f"; a short ask's key is its whole text {whole_ok}; a long ask keeps the prefix key {prefix_ok}"
+                    + f"; sabotage (whole words anywhere) falsely settles the embedded ask {caught38a}"
+                    + f"; sabotage (no key for short asks) loses the real one {caught38b}")
+    except Exception as ex:
+        detail38 = f"could not run: {type(ex).__name__}: {ex}"
+    check(38, "may be settled: a short ask by its whole text standing alone in a ledger, never by its words inside "
+          "another sentence, and never with no key at all", ok38, detail38,
+          "ledger row shape (monitor_actions.reply): '| Reply from the Agents app: <first 60 characters of the ask> | "
+          "his words, typed in the Agents app HH:MM, to the X window (lane y), item <id> | <his words> |'")
 
     _sh.rmtree(sdir, ignore_errors=True)
 

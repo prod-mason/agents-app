@@ -35,6 +35,7 @@ Expect to adapt the paths and the status-file format to your own setup.
 | `monitor/monitor_data.py` | the data engine; run it on its own to print the table and waiting list for an agent |
 | `monitor/monitor_actions.py` | renames, replies, the already-resolved check and grouping |
 | `monitor/alarm.py` | lets an agent call every other agent for help |
+| `monitor/decisions.py` | prints the waiting list grouped into single decisions (one answer for every agent asking the same thing); its self-test fixtures are not included |
 | `monitor/richtext.py` | renders bold, italics, highlights and emoji in descriptions |
 | `monitor/build_app.py` | builds `/Applications/Agents.app`, a small launcher around `agents_app.py` |
 | `monitor/app_live_test.py` | the live test of the running app |

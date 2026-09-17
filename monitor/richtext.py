@@ -48,12 +48,12 @@ import sys
 import unicodedata
 
 __all__ = [
-    "LIMIT", "PALETTE", "visible_text", "visible_len", "opening_line",
+    "LIMIT", "PALETTE", "visible_text", "visible_len", "grapheme_len", "opening_line",
     "is_complete", "parse_inline", "parse_blocks", "fold_line", "inline_attributed",
     "default_colors", "to_html",
 ]
 
-LIMIT = 200          # visible characters allowed in the Description title line
+LIMIT = 200          # characters a reader counts (grapheme clusters) in the Description title line
 
 # ---------------------------------------------------------------------------
 # Palette: one table feeds both the CSS and the NSColors.
@@ -863,6 +863,145 @@ def _runs(md):
     return out
 
 
+# ---------------------------------------------------------------------------
+# How many characters a reader sees: grapheme clusters
+# ---------------------------------------------------------------------------
+# Python's len() counts code points, so one emoji could cost 7 of the 50 a
+# headline gets (GPT-5.6 Sol review, 15 Sep). A reader counts what is DRAWN:
+# one family, one flag, one accented letter. These are Unicode's extended
+# grapheme clusters (UAX #29), clustered here by hand because neither python3
+# on this Mac has the `regex` or `grapheme` module. Checked against Foundation's
+# own composed character sequences in the planted controls.
+_RI_RANGE = (0x1F1E6, 0x1F1FF)                 # regional indicators, a flag is two
+_EXTEND_RANGES = ((0xFE00, 0xFE0F),            # variation selectors 1 to 16
+                  (0xE0100, 0xE01EF),          # variation selectors 17 to 256
+                  (0x1F3FB, 0x1F3FF),          # skin tone modifiers
+                  (0xE0020, 0xE007F))          # tag characters (the England flag and friends)
+_HANGUL = ((0x1100, 0x115F, "L"), (0xA960, 0xA97C, "L"), (0x1160, 0x11A7, "V"), (0xD7B0, 0xD7C6, "V"),
+           (0x11A8, 0x11FF, "T"), (0xD7CB, 0xD7FB, "T"))
+# Extended_Pictographic, wide enough for the GB11 emoji-ZWJ rule; it decides only
+# whether a ZWJ joins two pictures, never whether something is text.
+_PICTO_RANGES = ((0x00A9, 0x00A9), (0x00AE, 0x00AE), (0x203C, 0x203C), (0x2049, 0x2049), (0x2122, 0x2122),
+                 (0x2139, 0x2139), (0x2194, 0x21AA), (0x231A, 0x231B), (0x2328, 0x2328), (0x2388, 0x2388),
+                 (0x23CF, 0x23F3), (0x23F8, 0x23FA), (0x24C2, 0x24C2), (0x25AA, 0x25FE), (0x2600, 0x27BF),
+                 (0x2934, 0x2935), (0x2B00, 0x2BFF), (0x3030, 0x3030), (0x303D, 0x303D), (0x3297, 0x3297),
+                 (0x3299, 0x3299), (0x1F000, 0x1FAFF), (0x1FC00, 0x1FFFD))
+_GB_CACHE = {}
+
+
+def _in(cp, ranges):
+    return any(a <= cp <= b for a, b in ranges)
+
+
+def _is_picto(ch):
+    return _in(ord(ch), _PICTO_RANGES)
+
+
+def _gb_class(ch):
+    """The character's grapheme break class: CR, LF, Control, Extend, ZWJ, SpacingMark, RI, one of the
+    Hangul classes, or Other."""
+    c = _GB_CACHE.get(ch)
+    if c is not None:
+        return c
+    cp = ord(ch)
+    if cp == 0x0D:
+        c = "CR"
+    elif cp == 0x0A:
+        c = "LF"
+    elif cp == 0x200D:
+        c = "ZWJ"
+    elif _in(cp, (_RI_RANGE,)):
+        c = "RI"
+    elif cp == 0x200C or _in(cp, _EXTEND_RANGES):
+        c = "Extend"                               # before Control: tags and U+200C are Cf
+    else:
+        cat = unicodedata.category(ch)
+        if cat in ("Mn", "Me"):
+            c = "Extend"
+        elif cat in ("Cc", "Cf", "Zl", "Zp"):
+            c = "Control"                          # a BOM or a paragraph separator stands alone
+        elif cat == "Mc":
+            c = "SpacingMark"
+        else:
+            c = next((k for a, b, k in _HANGUL if a <= cp <= b), None) \
+                or ("LV" if 0xAC00 <= cp <= 0xD7A3 and (cp - 0xAC00) % 28 == 0
+                    else "LVT" if 0xAC00 <= cp <= 0xD7A3 else "Other")
+    if len(_GB_CACHE) < 4096:
+        _GB_CACHE[ch] = c
+    return c
+
+
+def _hangul_end(s, i):
+    j, n = i, len(s)
+    while j < n and _gb_class(s[j]) == "L":
+        j += 1
+    if j < n and _gb_class(s[j]) in ("LV", "LVT"):
+        if _gb_class(s[j]) == "LV":
+            j += 1
+            while j < n and _gb_class(s[j]) == "V":
+                j += 1
+        else:
+            j += 1
+    else:
+        while j < n and _gb_class(s[j]) == "V":
+            j += 1
+    while j < n and _gb_class(s[j]) == "T":
+        j += 1
+    return max(j, i + 1)
+
+
+def _cluster_end(s, i):
+    """Where the grapheme cluster starting at i ends."""
+    n = len(s)
+    cls = _gb_class(s[i])
+    if cls == "CR":
+        return i + 2 if i + 1 < n and s[i + 1] == "\n" else i + 1
+    if cls in ("LF", "Control"):
+        return i + 1
+    if cls in ("L", "V", "T", "LV", "LVT"):
+        j = _hangul_end(s, i)
+    elif cls == "RI":
+        j = i + 2 if i + 1 < n and _gb_class(s[i + 1]) == "RI" else i + 1
+    else:
+        j = i + 1
+    picto = _is_picto(s[i])
+    while j < n:
+        k = _gb_class(s[j])
+        if k in ("Extend", "SpacingMark"):
+            j += 1
+        elif k == "ZWJ":
+            if picto and j + 1 < n and _is_picto(s[j + 1]):
+                j += 2                             # GB11: one picture joined to the next
+            else:
+                j += 1
+        else:
+            break
+    return j
+
+
+def grapheme_len(s):
+    """How many characters a reader sees in s: extended grapheme clusters. A skin-toned thumbs up is
+    1, a four-person ZWJ family is 1, a flag is 1, "e" with a combining accent is 1.
+
+    SPEED. Nothing below U+0300 can ever join the character before it (the combining marks, the Hangul
+    parts, the regional indicators, ZWJ and the variation selectors all sit above it), so plain text
+    costs one comparison a character and only the real clusters are walked. An all-ASCII line is
+    counted straight from len(), which keeps the 180,000-character line in the timing control at
+    0.001 s instead of 0.25 s."""
+    s = s or ""
+    if s.isascii():
+        return len(s) - s.count("\r\n")           # one cluster each, CR LF the only pair
+    n, i, out = len(s), 0, 0
+    while i < n:
+        c = s[i]
+        if c != "\r" and ord(c) < 0x300 and (i + 1 >= n or ord(s[i + 1]) < 0x300):
+            i += 1
+        else:
+            i = _cluster_end(s, i)
+        out += 1
+    return out
+
+
 def visible_text(md):
     """The text as a reader sees it: Markdown markers removed.
 
@@ -871,17 +1010,18 @@ def visible_text(md):
     table cells are separated by a tab and fence lines vanish while the code
     inside stays. Emoji pass through unchanged.
 
-    Length unit: Python's len(), which counts Unicode code points. An emoji can
-    be more than one: a thumbs up with a skin tone is 2, and a ZWJ family of
-    four (man, woman, girl, boy joined by U+200D) is 7.
+    Length unit: see visible_len. This function returns the text itself, so
+    len() on it counts code points, of which one drawn emoji can be several.
     """
     return "".join(t for t, _ in _runs(md))
 
 
 def visible_len(md):
-    """len(visible_text(md)): code points, so a skin-toned emoji counts 2 and
-    a four-person ZWJ family counts 7 (see visible_text)."""
-    return len(visible_text(md))
+    """How many characters a READER counts in visible_text(md): grapheme
+    clusters (grapheme_len), so a thumbs up with a skin tone is 1 and a
+    four-person ZWJ family is 1. Until 15 Sep this was len(), which counted
+    code points and charged that family 7 of a headline's 50."""
+    return grapheme_len(visible_text(md))
 
 
 # ---------------------------------------------------------------------------
@@ -961,8 +1101,10 @@ def opening_line(md):
                    characters, NEVER cut. Lines that show nothing are skipped:
                    blank or zero-width-only lines, a code fence line, a ---
                    rule, a bare # or >.
-      visible_len  len(visible_text(fold_line(line))), code points (see
-                   visible_text); exactly the length of inline_attributed(line)
+      visible_len  visible_len(fold_line(line)): the characters a reader counts,
+                   grapheme clusters (see visible_len). inline_attributed(line)
+                   draws exactly this text, but its own length() counts UTF-16
+                   units, which is larger wherever an emoji is drawn
       complete     is_complete(that visible text), but always False when code
       ok           complete and visible_len <= LIMIT (200)
       code         True when that line sits inside a fenced code block, i.e. the
@@ -999,7 +1141,7 @@ def opening_line(md):
         break
     if vis is None:
         vis = visible_text(fold_line(line))
-    n = len(vis)
+    n = grapheme_len(vis)
     done = (not code) and is_complete(vis)
     return {"line": line, "visible_len": n, "complete": done, "ok": done and n <= LIMIT,
             "code": code}
@@ -1475,6 +1617,48 @@ def _controls():
         n = visible_len("**ab** ==c==")
         return n == 4, "got %d" % n
 
+    @control("visible_len counts what a reader sees: a ZWJ family is 1, not 7", {"grapheme_len": len})
+    def _():
+        plain = {
+            "ZWJ family of four": (_FAMILY, 1),
+            "thumbs up with a skin tone": (_EMOJI_SEQ, 1),
+            "one flag": ("\U0001F1FA\U0001F1F8", 1),
+            "two flags in a row": ("\U0001F1FA\U0001F1F8\U0001F1EC\U0001F1E7", 2),
+            "keycap 1": ("1️⃣", 1),
+            "e with a combining accent": ("é", 1),
+            "Hangul syllable written in parts": ("각", 1),
+            "tag sequence flag": ("\U0001F3F4" + "".join(chr(c) for c in (0xE0067, 0xE0062, 0xE0065,
+                                                                          0xE006E, 0xE0067, 0xE007F)), 1),
+            "four pictures joined by ZWJ": ("\U0001F469‍❤️‍\U0001F48B‍\U0001F468", 1),
+            "heart with a variation selector": ("❤️", 1),
+            "plain letters and a space": ("a b", 3),
+        }
+        bad = ["%s: %d not %d" % (n, visible_len(s), w) for n, (s, w) in plain.items() if visible_len(s) != w]
+        if visible_len("**Shipped %s** now" % _FAMILY) != 13:
+            bad.append("a family inside bold text")
+        # The headline limit is what a reader counts: 49 letters and one family emoji is 50, not 56.
+        head = opening_line("Waiting on you: " + "x" * 33 + _FAMILY)
+        if not (head["visible_len"] == 50 and head["ok"]):
+            bad.append("headline %d, ok %s" % (head["visible_len"], head["ok"]))
+        ref = "Foundation not checked"
+        try:                                  # calibration: Apple's own composed character sequences
+            import Foundation
+            off = []
+            for n, (s, _w) in plain.items():
+                ns = Foundation.NSString.stringWithString_(s)
+                ns = ns.nsstring() if hasattr(ns, "nsstring") else ns
+                i = c = 0
+                while i < ns.length():
+                    r = ns.rangeOfComposedCharacterSequenceAtIndex_(i)
+                    i, c = r[0] + r[1], c + 1
+                if c != grapheme_len(s):
+                    off.append("%s: mine %d, Foundation %d" % (n, grapheme_len(s), c))
+            bad += off
+            ref = "agrees with Foundation on all %d" % len(plain) if not off else "; ".join(off)
+        except ImportError:
+            pass
+        return not bad, "; ".join(bad) if bad else ref
+
     @control("opening_line: 200 visible ok, 201 not", {"visible_text": lambda md: md})
     def _():
         l200 = "**Done:** " + "w" * 193 + "."        # raw 204 chars, visible 200
@@ -1916,7 +2100,7 @@ def corpus_report(out_dir=None, verbose=True):
             raw = raw_markers(doc)
             try:
                 cell = str(inline_attributed(ol["line"]).string())
-                if cell != visible_text(fold_line(ol["line"])) or len(cell) != ol["visible_len"]:
+                if cell != visible_text(fold_line(ol["line"])) or grapheme_len(cell) != ol["visible_len"]:
                     mismatch.append(pid)
             except ImportError:
                 cell = None
